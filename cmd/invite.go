@@ -54,6 +54,10 @@ func Invite(args []string) {
 	dtmfDur := fs.Duration("dtmf-duration", 120*time.Millisecond, "每个 digit 持续时长")
 	dtmfGap := fs.Duration("dtmf-gap", 80*time.Millisecond, "digit 之间空隙")
 
+	// Re-INVITE / hold(RFC 3261 §14):通话期发 re-INVITE 切 SDP direction
+	holdAfter := fs.Duration("hold-after", 0, "通话建立后 N 秒发 re-INVITE with a=sendonly(进 hold 态);0=不 hold")
+	holdDur := fs.Duration("hold-duration", 0, "hold 持续 M 秒后再发 re-INVITE with a=sendrecv(resume);0=进 hold 后不 resume")
+
 	pcapOpts := AttachPcap(fs)
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
@@ -118,6 +122,13 @@ func Invite(args []string) {
 		banner = append(banner,
 			clui.KV{K: "dtmf", V: clui.Green(dtmfDigits) + clui.Dim(fmt.Sprintf(" (%s, %s/digit +%s gap, after %s)", strings.ToLower(*dtmfMode), *dtmfDur, *dtmfGap, *dtmfDelay))},
 		)
+	}
+	if *holdAfter > 0 {
+		desc := fmt.Sprintf("hold after %s", *holdAfter)
+		if *holdDur > 0 {
+			desc += fmt.Sprintf(", resume after %s", *holdDur)
+		}
+		banner = append(banner, clui.KV{K: "re-INVITE", V: clui.Green(desc)})
 	}
 	Banner("invite", banner)
 
@@ -216,7 +227,12 @@ func Invite(args []string) {
 			p.DTMFPerDigit = *dtmfDur
 			p.DTMFGap = *dtmfGap
 		}
+		p.HoldAfter = *holdAfter
+		p.HoldDuration = *holdDur
 		res := runInviteOnce(ctx, p)
+		if rep != nil && res.WallDur > 0 {
+			rep.AddWallDuration(res.WallDur)
+		}
 		if res.Err != nil || (res.Status != 0 && res.Status >= 300) {
 			if res.Status != 0 {
 				fmt.Printf("FAIL: %d\n", res.Status)
@@ -259,6 +275,8 @@ func Invite(args []string) {
 		sp.DTMFPerDigit = *dtmfDur
 		sp.DTMFGap = *dtmfGap
 	}
+	sp.HoldAfter = *holdAfter
+	sp.HoldDuration = *holdDur
 	runStress(log, co, rep, pcmShared, sp)
 }
 
@@ -285,6 +303,11 @@ type callParams struct {
 	DTMFDelay     time.Duration
 	DTMFPerDigit  time.Duration
 	DTMFGap       time.Duration
+
+	// Re-INVITE / hold:HoldAfter>0 时通话建立后 N 秒发 re-INVITE a=sendonly;
+	// HoldDuration>0 时再 M 秒后发 re-INVITE a=sendrecv 恢复。
+	HoldAfter    time.Duration
+	HoldDuration time.Duration
 }
 
 type callResult struct {
@@ -442,10 +465,13 @@ func runInviteOnce(ctx context.Context, p callParams) callResult {
 	rtpCtx, rtpCancel := context.WithTimeout(ctx, p.Duration)
 	defer rtpCancel()
 
-	// in-dialog dispatcher:接住对端 BYE / INFO / UPDATE,在原 socket / TLS conn 回 200 OK
+	// in-dialog dispatcher:接住对端 BYE / INFO / UPDATE,在原 socket / TLS conn 回 200 OK。
+	// re-INVITE worker 启用时(reinviteActive=true),把响应路由到 reinviteResp 让 worker 拿到。
 	var (
-		remoteByeMu   sync.Mutex
-		remoteByeSeen bool
+		remoteByeMu       sync.Mutex
+		remoteByeSeen     bool
+		reinviteActive    atomic.Bool
+		reinviteResp      = make(chan *sipua.Message, 16)
 	)
 	go func() {
 		for {
@@ -457,7 +483,17 @@ func runInviteOnce(ctx context.Context, p callParams) callResult {
 					return
 				}
 				m, perr := sipua.Parse(in.Data)
-				if perr != nil || !m.IsRequest {
+				if perr != nil {
+					continue
+				}
+				// 响应路由到 re-INVITE worker(若 active)
+				if !m.IsRequest {
+					if reinviteActive.Load() && m.Headers.Get("Call-ID") == uac.CallID {
+						select {
+						case reinviteResp <- m:
+						default:
+						}
+					}
 					continue
 				}
 				if m.Headers.Get("Call-ID") != uac.CallID {
@@ -528,6 +564,92 @@ func runInviteOnce(ctx context.Context, p callParams) callResult {
 		}()
 	}
 
+	// re-INVITE / hold goroutine:HoldAfter 后发 a=sendonly,HoldDuration 后发 a=sendrecv 恢复。
+	// 复用同一 RTP socket(m=audio port 不变),走 dispatcher 路由响应。
+	doReInvite := func(dir sdp.MediaDirection) {
+		req := uac.BuildRequest("INVITE", p.To, fromURI, p.To)
+		// in-dialog re-INVITE 必须带初始 200 OK 给的 to-tag
+		req.Headers.Set("To", final.Headers.Get("To"))
+		req.Headers.Add("Contact", uac.LocalContact(sipua.ExtractSIPUser(fromURI)))
+		req.Headers.Add("Allow", "INVITE,ACK,CANCEL,BYE,OPTIONS,UPDATE")
+		req.Headers.Add("Content-Type", "application/sdp")
+		offer := sdp.Offer{
+			SessionID:  uint64(rand.Uint32()),
+			SessionVer: uint64(rand.Uint32()),
+			Username:   "dsipper",
+			Origin:     localIP,
+			ConnIP:     localIP,
+			AudioPort:  rtp.LocalPort(),
+			Codecs:     []sdp.Codec{codecObj, sdp.TelephoneEvent},
+			Direction:  dir,
+		}
+		req.Body = []byte(offer.Build())
+
+		reinviteActive.Store(true)
+		defer reinviteActive.Store(false)
+		// 清空残留响应
+		for {
+			select {
+			case <-reinviteResp:
+			default:
+				goto sendIt
+			}
+		}
+	sendIt:
+		if p.Recorder != nil {
+			p.Recorder.Record("TX", req, "")
+		}
+		raw := req.Build()
+		if err := t.Send(raw, dst); err != nil {
+			p.Log.Warn("re-INVITE send", "err", err, "dir", string(dir))
+			return
+		}
+		p.Log.Info("re-INVITE TX", "dir", string(dir), "call-id", uac.CallID)
+
+		deadline := time.After(p.Timeout)
+		for {
+			select {
+			case <-rtpCtx.Done():
+				return
+			case <-deadline:
+				p.Log.Warn("re-INVITE timeout", "dir", string(dir))
+				return
+			case m := <-reinviteResp:
+				if p.Recorder != nil {
+					p.Recorder.Record("RX", m, "")
+				}
+				if m.StatusCode < 200 {
+					continue
+				}
+				if m.StatusCode == 200 {
+					ackInvite(uac, m, p.To, dst)
+					p.Log.Info("re-INVITE ACK", "dir", string(dir), "status", 200)
+				} else {
+					p.Log.Warn("re-INVITE non-2xx", "status", m.StatusCode, "dir", string(dir))
+				}
+				return
+			}
+		}
+	}
+	if p.HoldAfter > 0 {
+		go func() {
+			select {
+			case <-rtpCtx.Done():
+				return
+			case <-time.After(p.HoldAfter):
+			}
+			doReInvite(sdp.DirSendOnly)
+			if p.HoldDuration > 0 {
+				select {
+				case <-rtpCtx.Done():
+					return
+				case <-time.After(p.HoldDuration):
+				}
+				doReInvite(sdp.DirSendRecv)
+			}
+		}()
+	}
+
 	if err := rtp.Send(rtpCtx, p.PCM); err != nil && rtpCtx.Err() == nil {
 		p.Log.Warn("rtp send", "err", err)
 	}
@@ -590,6 +712,9 @@ type stressParams struct {
 	DTMFDelay    time.Duration
 	DTMFPerDigit time.Duration
 	DTMFGap      time.Duration
+
+	HoldAfter    time.Duration
+	HoldDuration time.Duration
 }
 
 func runStress(log *slog.Logger, co *CommonOpts, rep *report.Recorder, pcm []int16, p stressParams) {
@@ -714,9 +839,14 @@ func runStress(log *slog.Logger, co *CommonOpts, rep *report.Recorder, pcm []int
 					cp.DTMFPerDigit = p.DTMFPerDigit
 					cp.DTMFGap = p.DTMFGap
 				}
+				cp.HoldAfter = p.HoldAfter
+				cp.HoldDuration = p.HoldDuration
 				res := runInviteOnce(ctx, cp)
 				cancel()
 				done.Add(1)
+				if rep != nil && res.WallDur > 0 {
+					rep.AddWallDuration(res.WallDur)
+				}
 				if res.Status == 200 && res.Err == nil {
 					okCnt.Add(1)
 					latMu.Lock()

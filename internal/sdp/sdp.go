@@ -24,6 +24,33 @@ var (
 	TelephoneEvent = Codec{PT: 101, Name: "telephone-event", Clock: 8000, Params: "0-15"}
 )
 
+// MediaDirection 是 SDP a=sendrecv / sendonly / recvonly / inactive 四态。
+// 空字符串等同 sendrecv(RFC 4566 默认)。
+type MediaDirection string
+
+const (
+	DirSendRecv MediaDirection = "sendrecv"
+	DirSendOnly MediaDirection = "sendonly"
+	DirRecvOnly MediaDirection = "recvonly"
+	DirInactive MediaDirection = "inactive"
+)
+
+// MirrorDirection 给 UAS 回 200 OK 用,镜像对端 offer direction:
+// sendonly → recvonly (对端只发我只收),recvonly → sendonly,inactive → inactive,
+// 其他全 sendrecv。
+func MirrorDirection(d MediaDirection) MediaDirection {
+	switch d {
+	case DirSendOnly:
+		return DirRecvOnly
+	case DirRecvOnly:
+		return DirSendOnly
+	case DirInactive:
+		return DirInactive
+	default:
+		return DirSendRecv
+	}
+}
+
 // Offer 是发起方的 SDP 描述。
 type Offer struct {
 	SessionID  uint64
@@ -33,6 +60,7 @@ type Offer struct {
 	ConnIP     string // c= 字段
 	AudioPort  int    // m=audio
 	Codecs     []Codec
+	Direction  MediaDirection // 空=sendrecv
 }
 
 // Build 渲染成 SDP 文本。
@@ -58,7 +86,11 @@ func (o Offer) Build() string {
 			fmt.Fprintf(&b, "a=fmtp:%d %s\r\n", c.PT, c.Params)
 		}
 	}
-	fmt.Fprintf(&b, "a=sendrecv\r\n")
+	dir := o.Direction
+	if dir == "" {
+		dir = DirSendRecv
+	}
+	fmt.Fprintf(&b, "a=%s\r\n", dir)
 	fmt.Fprintf(&b, "a=ptime:20\r\n")
 	return b.String()
 }
@@ -67,7 +99,8 @@ func (o Offer) Build() string {
 type Answer struct {
 	ConnIP    string
 	AudioPort int
-	Codec     Codec // 对端真正选定的第一个 audio codec
+	Codec     Codec          // 对端真正选定的第一个 audio codec
+	Direction MediaDirection // 对端 SDP 声明的 direction,默认 sendrecv
 }
 
 // Parse 解析对端 SDP,只抽我们关心的字段。
@@ -92,6 +125,14 @@ func Parse(body string) (Answer, error) {
 					firstPT = pt
 				}
 			}
+		case line == "a=sendrecv":
+			a.Direction = DirSendRecv
+		case line == "a=sendonly":
+			a.Direction = DirSendOnly
+		case line == "a=recvonly":
+			a.Direction = DirRecvOnly
+		case line == "a=inactive":
+			a.Direction = DirInactive
 		case strings.HasPrefix(line, "a=rtpmap:"):
 			rest := strings.TrimPrefix(line, "a=rtpmap:")
 			fields := strings.Fields(rest)
@@ -112,6 +153,9 @@ func Parse(body string) (Answer, error) {
 	}
 	if a.ConnIP == "" || a.AudioPort == 0 {
 		return a, fmt.Errorf("SDP 缺 c= 或 m=audio")
+	}
+	if a.Direction == "" {
+		a.Direction = DirSendRecv
 	}
 	// 优先用 m= 第一个 PT;若 PT < 96 是静态,可不依赖 rtpmap
 	if firstPT >= 0 {

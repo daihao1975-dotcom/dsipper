@@ -228,6 +228,11 @@ func Listen(args []string) {
 				replyStatus(t, in, m, 200, "OK", rep)
 				log.Info("OPTIONS RX", "from", in.From)
 			case "INVITE":
+				// re-INVITE(in-dialog):To 已带 tag → 镜像 direction 回 200 OK,不开新 call
+				if strings.Contains(m.Headers.Get("To"), "tag=") {
+					handleReInvite(t, in, m, codecObj, log, rep)
+					continue
+				}
 				callIdx++
 				if rep != nil {
 					localAddr := ""
@@ -266,6 +271,43 @@ func Listen(args []string) {
 // handleIncomingCallSignalingOnly 纯信令应答(不开 RTP),用于 cps 压测。
 // 直接在 listen 主 loop 里同步回 200 OK,几百 μs 完成,不 spawn goroutine,不建任何 UDP socket。
 // dialog 注册 to-tag 到 dialogTable,后续收到 BYE 主 loop 那一支会 cancel。
+// handleReInvite 处理 in-dialog re-INVITE(RFC 3261 §14):解 SDP direction,
+// 镜像回 200 OK with answer SDP(direction=MirrorDirection(offer.dir))。本地
+// RTP 行为不变(socket/port 一致),仅信令层应答让对端 UAC 满意。
+func handleReInvite(t sipua.Transport, in sipua.Inbound, req *sipua.Message,
+	codecObj sdp.Codec, log *slog.Logger, rep *report.Recorder) {
+	offer, perr := sdp.Parse(string(req.Body))
+	if perr != nil {
+		log.Warn("re-INVITE bad SDP", "err", perr)
+		replyStatus(t, in, req, 488, "Not Acceptable Here", rep)
+		return
+	}
+	resp := buildResponse(req, 200, "OK")
+	// 保持 To-tag 跟 initial 一致 — req.To 已带 tag(因为是 in-dialog),buildResponse 已镜像;
+	// 加 Contact 让对端后续 in-dialog 请求能路由回来
+	if la := t.LocalAddr(); la != nil {
+		resp.Headers.Add("Contact", fmt.Sprintf("<sip:%s;transport=%s>", la.String(), strings.ToLower(t.Proto())))
+	}
+	resp.Headers.Add("Content-Type", "application/sdp")
+	answer := sdp.Offer{
+		SessionID:  uint64(rand.Uint32()),
+		SessionVer: uint64(rand.Uint32()),
+		Username:   "dsipper",
+		Origin:     offer.ConnIP,
+		ConnIP:     offer.ConnIP,
+		AudioPort:  offer.AudioPort,
+		Codecs:     []sdp.Codec{codecObj, sdp.TelephoneEvent},
+		Direction:  sdp.MirrorDirection(offer.Direction),
+	}
+	resp.Body = []byte(answer.Build())
+	sendReply(t, in, resp, rep)
+	log.Info("re-INVITE RX → 200 OK",
+		"call-id", req.Headers.Get("Call-ID"),
+		"cseq", req.Headers.Get("CSeq"),
+		"offer-dir", string(offer.Direction),
+		"answer-dir", string(answer.Direction))
+}
+
 func handleIncomingCallSignalingOnly(t sipua.Transport, in sipua.Inbound, invite *sipua.Message,
 	log *slog.Logger, dt *dialogTable, rep *report.Recorder) {
 	resp := buildResponse(invite, 200, "OK")

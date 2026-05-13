@@ -1,296 +1,360 @@
 # dsipper — SIP / RTP mock client for SBC debugging
 
-工程师调 SBC / 信令网关时常用的 4 个动作:**注册 / 探活 / 主叫 / 接听**,以单 binary 形式提供。
-信令支持 **UDP** 与 **TLS**,媒体始终是**明文 RTP**(无 SRTP),编码 G.711a / G.711u。
+[中文版 / Chinese README](README.zh-CN.md)
 
-## v0.8 新增 — UI 增强
-
-- **多行实时面板**(`internal/clui.LivePanel`)替换之前的单行 \r 进度。invite stress 模式与 listen `--ui` 共用同一组件,刷新走 ANSI 上移 + 整屏区清屏 + cursor 隐藏,稳。非 tty(管道 / 重定向)自动 noop。
-- **invite stress panel** 实时呈现:unicode 进度条 + launched/inflight/workers + ok/fail + 当前 cps + p50/p95 wall + status 分布 + ETA + elapsed。
-- **listen --ui panel**:total/active + ok/fail + cps now / avg + status 分布 + uptime。
-- **stress summary 增强**:加 `status` 行(top-6 状态码 + 计数,2xx 绿 ≥300 红)+ `err top` 行(失败原因聚合 top-3,带次数)。
-- **panel 模式自动屏蔽 stderr 日志 tee**:面板运行期间日志只落文件(`tail -f` 可看);避免 slog 行打断面板重绘。
-- **进度条 helper** `clui.ProgressBar(cur, total, width)` 用 unicode `█/░`,任意 caller 可复用。
-
-```sh
-# 看个生动的:200 通,12 并发,目标 8 cps
-dsipper invite --server SBC:5060 --transport udp \
-               --to sip:1001@example.com --duration 3s --save-recv "" \
-               --total 200 --concurrency 12 --cps 8
-```
-
-## v0.7 新增
-
-- **DTMF 双模式** — `--dtmf "1234#" --dtmf-mode rfc4733|inband|both`。
-  - `rfc4733`(默认):带外 PT 101 RTP 包,RFC 4733 §2.5 标准时序(start + N update at 50ms + 3 end packets E=1),共享 SSRC,事件期间主语音流静音让 wire 让位。SDP 已声明 `a=fmtp:101 0-15`。
-  - `inband`:DTMF 双音(行频+列频两个正弦叠加,ITU-T Q.23 频率)直接合成 PCM splice 进主音频流,跟 G.711 一起走 PT 0/8。老 PBX / ATA / 真实电话 IVR 必备。
-  - `both`:两路同发,最大兼容性。
-  - 时序参数 `--dtmf-delay 500ms --dtmf-duration 120ms --dtmf-gap 80ms` 三项可调。listen 端自动识别 RFC 4733 入站事件并打 log + `call done` 行带 `dtmf=...`。
-- **TLS keepalive** — `--tls-keepalive 30s` 启 RFC 5626 双 CRLF 心跳(`\r\n\r\n`),防 SBC / NAT 闲置拆链;UDP 模式忽略。
-
-```sh
-# 主叫拨 1001,接通后等 500ms 发 DTMF "1234#"(带外 + 带内同发)
-dsipper invite --server SBC:5060 --transport udp \
-               --to sip:1001@example.com --duration 8s \
-               --dtmf "1234#" --dtmf-mode both
-# 长 TLS 连接,30s 心跳
-dsipper options --server sbc.example.com:5061 --transport tls --tls-keepalive 30s
-```
-
-## v0.6 新增
-
-- **invite 并发压测模式** — `--total N --concurrency M --cps R` 一条命令打压测。每 worker 独立 transport + UAC + RTP session,共享 Recorder 汇总。退出打 stress summary box(ok/fail/elapsed/actual cps/p50/p95 wall)。`--cps 0` 不限速,worker 自由跑;受 concurrency 与单通时长共同制约。
-
-```sh
-# 30 通,10 并发,目标 5 cps,共享 HTML report
-dsipper invite --server SBC:5060 --transport udp \
-               --to sip:1001@example.com --duration 2s \
-               --total 30 --concurrency 10 --cps 5 \
-               --report stress.html --save-recv ""
-```
-
-`--save-recv` 非空时,每通会落 `recv-NNNN.wav` 加序号后缀;压测一般填 `""` 不保存。
-
-## v0.5 新增
-
-- **HTML 信令 report** — `--report <dir>` 退出时落一份 HTML,失败通可点击展开 SVG 时序图(钉蓝/苹果绿/红配色),成功通只算汇总数。`--report-max-failed 50` 控失败详情上限,溢出仅计入顶部 status code 分布表。
-- **日志只保失败** — `--log-only-failed` 把含 call-id 的日志按通缓存,2xx final 时丢弃,>= 300 / 退出 pending 时才落盘。几千万通成功呼叫磁盘 0 增长。
-- **日志滚动** — `--log-max-mb 100` 单文件满即 rename 到 `.old`(覆盖旧 .old),磁盘最多 2 × max。
-- **阿屠宰风 CLI** — 启动时打印钉蓝 logo + 圆角 unicode 配置 box;`listen --ui` 启用 1Hz 实时统计面板(total / ok / fail / active / cps);pipe 时自动降级无色。
+A single-binary SIP / RTP mock client built for engineers who debug SBCs, signaling
+gateways and IVR systems day-to-day. Covers the four daily debugging actions —
+**register / probe / call / answer** — over **UDP** or **TLS**, with **plain RTP**
+G.711a/G.711u media (no SRTP).
 
 ```
 ┌─────────────────┐  SIP/UDP|TLS  ┌──────────────┐  SIP/UDP|TLS  ┌─────────────────┐
 │  dsipper invite │ ────────────► │     SBC      │ ────────────► │ dsipper listen  │
-│  (UAC,主叫)     │               │ (under test) │               │  (UAS,被叫)     │
+│  (UAC, caller)  │               │ (under test) │               │  (UAS, callee)  │
 │  ◄── RTP plain ──────────────────  rtpengine   ──────────────── plain RTP ────►   │
 └─────────────────┘                └──────────────┘               └─────────────────┘
 ```
 
-## 快速开始
+## Features
+
+- **UDP / TLS signaling** + **plain RTP** G.711a/u (no SRTP, no DTLS by design)
+- **Four subcommands**: `options` (probe), `register` (Digest auth), `invite`
+  (place a real call), `listen` (UAS, answer calls)
+- **Built-in load test** — `invite --total N --concurrency M --cps R`
+- **DTMF dual mode** — RFC 4733 out-of-band on PT 101 *and* ITU-T Q.23 in-band
+  dual tone spliced into the audio stream
+- **Re-INVITE / hold** — mid-call SDP direction switching (`sendonly` / `sendrecv`)
+- **TLS keepalive** — RFC 5626 double-CRLF ping
+- **HTML signaling report** — failed calls get an inline SVG ladder diagram,
+  status pie chart and wall-time histogram on top
+- **Live multi-line panel** — progress bar, p50/p95 wall, status distribution,
+  ETA — refreshed in place with ANSI cursor moves
+- **Failure-only logs** + **100MB rotation** — millions of successful calls
+  leave zero disk growth
+- Static cross-compile to 4 platforms (darwin/arm64, darwin/amd64,
+  linux/amd64, linux/arm64), no cgo
+
+## Install
 
 ```sh
-# 编译当前平台 binary
-make build
+# from source (Go 1.21+ required)
+git clone https://github.com/daihao1975-dotcom/dsipper.git
+cd dsipper && make build
 ./bin/dsipper --help
 
-# 同机环路自测 (一台机器跑 UAS + UAC)
-./bin/dsipper listen --bind 127.0.0.1:5070 --transport udp &
-./bin/dsipper invite --server 127.0.0.1:5070 --transport udp \
-                     --to sip:bob@127.0.0.1 --duration 5s
-# 退出 UAS:Ctrl-C 或 kill。完了得到 recv.wav(UAC 收到的)。
+# or download a prebuilt binary from the GitHub Releases page
 ```
 
-## 子命令
+## Quick start — same-host loopback
 
-### 1. `options` — 探活
+```sh
+# Terminal A: UAS that answers any incoming call
+./bin/dsipper listen --bind 127.0.0.1:5070 --transport udp
+
+# Terminal B: place one call, save what we received as recv.wav
+./bin/dsipper invite --server 127.0.0.1:5070 --transport udp \
+                     --to sip:bob@127.0.0.1 --duration 5s
+```
+
+## Subcommands
+
+### 1. `options` — health probe
 
 ```sh
 dsipper options --server SBC_IP:5060 --transport udp
 dsipper options --server sbc.example.com:5061 --transport tls
 ```
 
-成功返 `OK: 200 OK` exit 0;失败 exit 1。CI / 监控脚本可直接用 exit code。
+Exits 0 on `200 OK`, non-zero otherwise — drop straight into CI / monitoring.
 
-### 2. `register` — REGISTER 带 Digest auth
+### 2. `register` — REGISTER with Digest auth
 
 ```sh
-# 不带认证
+# no auth
 dsipper register --server SBC_IP:5060 --transport udp \
                  --user 1000 --domain example.com
 
-# 带认证(401 challenge → 自动重发 Authorization)
+# with auth (re-sends on 401 challenge)
 dsipper register --server SBC_IP:5060 --transport udp \
                  --user 1000 --pass s3cret --domain example.com --expires 60
 ```
 
-### 3. `invite` — 主叫一通真实呼叫,带 RTP
+### 3. `invite` — place a real call with RTP
 
 ```sh
-# 默认:发 440Hz 正弦波 10 秒,把对端 RTP 解码存 recv.wav
+# default: 440 Hz sine wave for 10 s, save received RTP as recv.wav
 dsipper invite --server SBC_IP:5060 --transport udp \
                --to sip:1001@example.com
 
-# TLS + 自有 WAV 文件 + 自定义时长
+# TLS, custom WAV, longer call, save the received audio elsewhere
 dsipper invite --server sbc.example.com:5061 --transport tls \
                --to sip:1001@example.com \
                --wav /tmp/prompt.wav --duration 30s --codec PCMU \
                --save-recv /tmp/answer.wav
+
+# Concurrent load test: 300 calls × 12 workers @ 8 cps + HTML report
+dsipper invite --server SBC_IP:5060 --transport udp \
+               --to sip:1001@example.com --duration 3s --save-recv "" \
+               --total 300 --concurrency 12 --cps 8 \
+               --report stress.html
+
+# DTMF (RFC 4733 out-of-band + in-band, max compatibility)
+dsipper invite --server SBC_IP:5060 --transport udp \
+               --to sip:1001@example.com --duration 8s \
+               --dtmf "1234#" --dtmf-mode both
+
+# Mid-call hold/resume: hold after 2s, resume after another 3s
+dsipper invite --server SBC_IP:5060 --transport udp \
+               --to sip:1001@example.com --duration 10s \
+               --hold-after 2s --hold-duration 3s
 ```
 
-退出后打印:
+On exit it prints something like:
+
 ```
-OK: call 30s,RTP tx=1500 pkts/258000 B  rx=1500 pkts/258000 B
+OK: call 30s, RTP tx=1500 pkts/258000 B  rx=1500 pkts/258000 B
 recv WAV: /tmp/answer.wav
 ```
 
-WAV 文件要求:**16-bit PCM mono 8 kHz**(电话标准)。
+WAV files must be **16-bit PCM mono 8 kHz** (telephony standard).
 
-### 4. `listen` — UAS 接听模式
+### 4. `listen` — UAS, answer incoming calls
 
 ```sh
 # UDP
 dsipper listen --bind 0.0.0.0:5060 --transport udp \
                --tone 880 --save-recv rx
 
-# TLS server,需要 cert + key
+# TLS server, requires cert + key
 dsipper listen --bind 0.0.0.0:5061 --transport tls \
                --cert ./certs/server.crt --key ./certs/server.key \
                --save-recv rx
 
-# UAS 主动 BYE — 200 OK 后 60 秒发 BYE(UDP / TLS 通用)
+# UAS actively sends BYE 60s after answering
 dsipper listen --bind 0.0.0.0:5060 --transport udp --bye-after 60s
+
+# Live UI panel (multi-line, refreshed at 1 Hz)
+dsipper listen --bind 0.0.0.0:5060 --transport udp --ui
 ```
 
-每接到一通 INVITE:`100 Trying` → `180 Ringing` → `200 OK` + SDP answer,
-回送 880 Hz 正弦波,记录主叫发来的 RTP 到 `rx-N.wav`(N 是呼叫序号)。
-收到对端 BYE 立即关闭 RTP 并 dump WAV;Ctrl-C 退出时 dump 所有未结束呼叫。
+For each incoming INVITE: `100 Trying → 180 Ringing → 200 OK` with an SDP answer,
+880 Hz sine wave is sent back, and the caller's RTP is recorded to `rx-N.wav`
+(N is the call sequence number). Receiving a BYE closes RTP immediately and
+dumps the WAV; Ctrl-C dumps anything in flight. `listen` also handles
+in-dialog **re-INVITE**, mirroring the offered SDP direction
+(`sendonly → recvonly`, etc.).
 
-**UAS 主动 BYE**:`--bye-after Nsec`(0 = 关,默认):答完 200 OK 起算
-N 秒后,UAS 主动构造 BYE 走原信令通道(TLS 走原 conn / UDP 走原 socket)
-回对端。RURI 取自 INVITE 的 Contact,From/To 互换 + 我方 to-tag,CSeq 1,
-Route 沿用 Record-Route。常用于实验室模拟"被叫挂机"场景。
+## Common flags (shared by register / invite / options)
 
-## 公共参数(register / invite / options 共享)
-
-| 参数 | 说明 | 默认 |
+| Flag | Meaning | Default |
 |---|---|---|
-| `--server` | 下游地址 host:port | (必填) |
+| `--server` | Downstream host:port | (required) |
 | `--transport` | `udp` / `tls` | udp |
-| `--insecure` | TLS 不校验 server 证书(自签场景) | true |
-| `--ca <file>` | TLS 用 CA 校验,设置后自动关 `--insecure` | (空) |
-| `-v` | 0 = info / 1 = debug(打印整条 SIP message) | 0 |
-| `--log` | 日志落盘路径,空=自动 `dsipper-<cmd>-<时间戳>.log`,`-` = 仅 stderr | 空 |
-| `--log-max-mb` | 单日志文件 size 上限(MB),满了 rename 到 `.log.old`;0 = 不滚 | 100 |
-| `--log-only-failed` | 只落失败通日志:含 call-id 的先 buffer,2xx 时丢,≥300 / 退出 pending 时 flush | false |
-| `--report` | 退出落 HTML 信令 report,目录或 `.html`;空=不生成 | 空 |
-| `--report-max-failed` | HTML 详情区保留失败通条数上限,溢出仅汇总 | 50 |
+| `--insecure` | TLS skip server cert verification (self-signed) | true |
+| `--ca <file>` | Verify server cert against this CA (auto-disables `--insecure`) | (empty) |
+| `-v` | 0 = info / 1 = debug (logs the full SIP message body) | 0 |
+| `--log` | Log file path. Empty = auto `dsipper-<cmd>-<timestamp>.log`. `-` = stderr only | (empty) |
+| `--log-max-mb` | Max log file size (MB) before rotating to `.log.old`; 0 = no rotation | 100 |
+| `--log-only-failed` | Buffer per-call logs; drop on 2xx, flush on ≥300 / process exit | false |
+| `--report` | Write an HTML signaling report on exit (dir or `.html` path); empty = off | (empty) |
+| `--report-max-failed` | Cap on per-call failed-detail entries in HTML (summary covers all) | 50 |
+| `--tls-keepalive` | RFC 5626 double-CRLF ping interval (e.g. `30s`); 0 = off | 0 |
 
-### TLS 严格校验
+### Strict TLS verification
 
 ```sh
 dsipper options --server sbc.example.com:5061 --transport tls \
                 --ca /etc/ssl/dh-ca.pem
 ```
 
-无 `--ca` 时默认走 InsecureSkipVerify(便于自签证书场景调试)。
+Without `--ca`, dsipper defaults to `InsecureSkipVerify` for easier self-signed
+debugging.
 
-## 编译与跨平台
+## Stress mode flags (`invite`)
 
-```sh
-make build                      # 当前平台
-make cross                      # 4 平台:darwin/arm64, darwin/amd64, linux/amd64, linux/arm64
-ls bin/
-# dsipper-darwin-arm64
-# dsipper-darwin-amd64
-# dsipper-linux-amd64
-# dsipper-linux-arm64
+| Flag | Meaning |
+|---|---|
+| `--total N` | Total number of calls; `> 1` triggers stress mode |
+| `--concurrency M` | Concurrent workers (each owns its own UAC, transport, RTP socket) |
+| `--cps R` | Target CPS rate limiter (token bucket); 0 = unbounded |
+
+Stress mode prints a **live multi-line panel** (refreshed at 1 Hz):
+
+```
+╭── invite stress ─────────────────────────────────────╮
+│ progress   ██████████████████░░░░░░ 6/8  75%         │
+│ launched   8  inflight 2  workers 4                  │
+│ ok / fail  6 ✓   0 ✗                                 │
+│ cps        2.00  target 4.0                          │
+│ wall       p50 1.203s   p95 1.205s                   │
+│ status     200 ✓ 6                                   │
+│ eta        1s  elapsed 3s                            │
+╰───────────────────────────────────────────────────────╯
 ```
 
-Linux 二进制是静态编译(`CGO_ENABLED=0`),`scp` 到任何 Linux 机器即可跑,无需安装运行时。
+A summary box prints after completion, including:
 
-## 工程师 cookbook
+- per-code status distribution (top 6 codes, ≥300 in red, 2xx in green)
+- top 3 error reasons with their counts
 
-### 验证 SBC 上线
+## DTMF (`invite`)
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--dtmf "1234#"` | Digits to send. `0-9`, `*`, `#`, `A`-`D` accepted (case-insensitive) | (empty) |
+| `--dtmf-mode` | `rfc4733` (out-of-band PT 101) / `inband` (Q.23 dual tone) / `both` | rfc4733 |
+| `--dtmf-delay` | When to start, measured from call setup | 500ms |
+| `--dtmf-duration` | Per-digit duration | 120ms |
+| `--dtmf-gap` | Silence between digits | 80ms |
+
+RFC 4733 mode sends a properly-paced sequence: first packet with the M-bit,
+update packets every 50 ms with growing duration, then three end packets
+(`E=1`) for redundancy — shared SSRC with the audio stream, audio is muted
+during the event window.
+
+In-band mode synthesises ITU-T Q.23 row/column frequencies (`697/770/852/941`
+× `1209/1336/1477/1633` Hz) and splices the dual-tone PCM into the main audio
+stream — works against legacy PBXes and ATA endpoints that don't decode RFC 4733.
+
+The receiver side (`listen`) auto-decodes inbound RFC 4733 events and reports
+them in `call done` lines (`dtmf=1234#`).
+
+## Re-INVITE / hold (`invite`)
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--hold-after` | After N seconds from call setup, send re-INVITE with `a=sendonly` (enter hold) | 0 (off) |
+| `--hold-duration` | After M seconds in hold, send re-INVITE with `a=sendrecv` (resume) | 0 (no resume) |
+
+The same dialog (Call-ID, From-tag, to-tag) is reused, CSeq advances, and the
+SDP `m=audio` port stays put — only the direction attribute changes. The UAS
+side (`listen`) parses the offer, mirrors the direction in the 200 OK answer
+(`sendonly → recvonly`, `recvonly → sendonly`, `inactive → inactive`).
+
+## Engineer cookbook
+
+### Verify an SBC is online
 
 ```sh
-# 1. SBC 探活
+# 1. probe
 dsipper options --server $SBC:5060 --transport udp
-# 期望 OK
 
-# 2. 注册一个测试号
+# 2. register a test number
 dsipper register --server $SBC:5060 --transport udp \
                  --user test1000 --pass test --domain $SBC_DOMAIN
-# 期望 OK: 200 Registered (auth MD5)
 
-# 3. 主叫一通(SBC 路由到下游 UAS)
+# 3. place one call (SBC routes to a downstream UAS)
 dsipper invite --server $SBC:5060 --transport udp \
                --to sip:test1001@$SBC_DOMAIN --duration 10s
-# 期望 RTP tx=500 rx=500 完美对称
 ```
 
-### 排查"信令通但没声音"
+Expecting `RTP tx=500 rx=500` symmetric.
 
-如果 INVITE/200/ACK 都过但 `rx=0` 包,说明 SBC 没把 RTP 转过来 — 检查 rtpengine /
-RTP 防火墙 / SDP `c=` 改写。
+### Debug "signaling works but no audio"
+
+INVITE / 200 OK / ACK all succeed but `rx=0` packets — the SBC isn't forwarding
+RTP. Check rtpengine, RTP firewall, SDP `c=` rewrite:
 
 ```sh
-# 主叫打开 verbose 看完整 SIP + SDP
 dsipper invite --server $SBC --transport udp --to sip:test@example.com \
                --duration 5s -v 1 2>&1 | tee call.log
-# 看 INVITE 里 m=audio 的 IP/port,再看 200 OK 里 m=audio 的 IP/port,
-# 确认 SBC 把媒体地址改写到了 SBC 自己(rtpengine relay 模式)。
+# Compare m=audio in the INVITE vs the 200 OK to confirm the SBC's
+# media address rewrite (rtpengine relay mode).
 ```
 
-### 验证 TLS 信令网关(`dh-sbc/tls-udp`)
+### Validate a TLS signaling gateway
 
 ```sh
-# 先用 OPTIONS 探活 TLS 端口,验证证书 + 端口都通
+# Trust whatever cert the gateway presents
 dsipper options --server tls-edge.example.com:5061 --transport tls --insecure
 
-# 用 ca 严格验证证书链
+# Or verify against a real CA
 dsipper options --server tls-edge.example.com:5061 --transport tls \
                 --ca /path/to/dh-ca.pem
 ```
 
-## 实现细节
+### Load-test a deployment
 
-| 模块 | 关键点 |
+```sh
+# 500 calls, 30 workers, 10 cps, 5 s per call, save HTML report
+dsipper invite --server $SBC:5060 --transport udp \
+               --to sip:test@example.com --duration 5s --save-recv "" \
+               --total 500 --concurrency 30 --cps 10 \
+               --report run-$(date +%H%M%S).html
+```
+
+The HTML report includes:
+
+- per-status pie chart and wall-time histogram across the entire run
+- the slowest failed calls with full ladder diagrams (`--report-max-failed N`)
+- a top status code table that tolerates dropped detail entries
+
+## Building & cross-compiling
+
+```sh
+make build                      # current platform
+make cross                      # darwin/arm64, darwin/amd64, linux/amd64, linux/arm64
+ls bin/
+```
+
+Linux binaries are statically compiled (`CGO_ENABLED=0`); scp to any Linux box
+and run — no runtime dependencies.
+
+## Implementation notes
+
+| Module | What's in it |
 |---|---|
-| SIP 协议 | 自写 message parse/build,支持折叠行 / 多值 header / Content-Length 拆包 |
-| Auth | RFC 2617 Digest MD5,支持 qop=auth(自动 nc/cnonce)与无 qop fallback |
-| Transport | UDP 单 socket / TLS over TCP 长连接复用 + SIP 帧按 Content-Length 切 |
-| TLS | TLSv1.2+,可配 InsecureSkipVerify / CA 文件 / SNI |
-| SDP | 最小可用:c= / m=audio / a=rtpmap;支持 telephone-event(RFC 2833 占位) |
-| RTP | pion/rtp 包结构 + monotonic ticker 防漂移(20ms ptime,160 samples G.711) |
-| 编码 | 自写 G.711 alaw/ulaw 编解码(纯 stdlib,无 codec 依赖) |
-| WAV | 自写 16-bit mono RIFF/WAVE 读写 |
-| 心跳 | TLS 长连接支持 RFC 5626 双 CRLF ping,通过 `--tls-keepalive Ns` 启用 |
+| `internal/sipua` | SIP message parse/build, Digest auth, UDP + TLS transports with single-stream framing |
+| `internal/sdp` | Minimal SDP offer/answer for G.711 + telephone-event, direction handling |
+| `internal/media` | G.711 alaw/ulaw codec, RTP session, WAV reader/writer, tone synthesis, DTMF |
+| `internal/report` | Per-call recorder, status pie + wall-time histogram, SVG ladder diagrams, HTML template |
+| `internal/clui` | ANSI truecolor logo, BannerBox, LivePanel, ProgressBar |
+| `internal/logsink` | RotatingFile + BufHandler (slog handler that drops per-call buffers on 2xx) |
 
-## 已知边界
+## Known boundaries
 
-| 项 | 状态 |
+| Item | Status |
 |---|---|
-| SRTP / DTLS | 不支持(本工具明确"RTP plain") |
-| WebSocket / WSS | 不支持(信令仅 UDP / TLS-over-TCP) |
-| codec | 仅 G.711a / G.711u(电话级,工程师调试足够;G.729 / Opus 不在范围) |
-| 多并发呼叫 | UAS 端可并发接听;UAC `invite --total N --concurrency M` 内置批量压测 |
-| DTMF | v0.7 起完整支持 RFC 4733 带外 + 带内双音,详见上方 v0.7 章节 |
-| re-INVITE / hold | 未实现(可选 v2) |
-| IPv6 | 未测试,理论上 stdlib net 已支持,Via 拼接处可能要小改 |
+| SRTP / DTLS | Not supported (this tool is intentionally "plain RTP") |
+| WebSocket / WSS | Not supported (signaling is UDP / TLS-over-TCP only) |
+| Codecs | G.711a / G.711u only (G.729 / Opus out of scope) |
+| Concurrent UAC | `invite --total N --concurrency M` covers built-in batch use |
+| DTMF | Full RFC 4733 + in-band — see flag table |
+| Re-INVITE / hold | Implemented for `a=sendonly`/`sendrecv` mid-call swap |
+| TLS keepalive | RFC 5626 double-CRLF ping, see `--tls-keepalive Ns` |
+| IPv6 | Untested; the stdlib `net` parts work, but Via construction may need tweaking |
 
-## 文件结构
+## Repository layout
 
 ```
 dsipper/
-├── main.go                 # 子命令路由
-├── go.mod / go.sum         # pion/rtp + 间接 randutil
-├── Makefile                # build / cross / test / fmt
-├── README.md
-├── cmd/                    # 子命令实现
-│   ├── common.go           # 共享 flag + transport 工厂
+├── main.go                     # subcommand router
+├── go.mod / go.sum             # pion/rtp + indirect deps
+├── Makefile                    # build / cross / test / fmt
+├── README.md                   # this file
+├── README.zh-CN.md             # 中文版
+├── LICENSE                     # MIT
+├── cmd/                        # subcommand implementations
+│   ├── common.go
 │   ├── options.go
 │   ├── register.go
 │   ├── invite.go
-│   └── listen.go
+│   ├── listen.go
+│   └── pcap.go
 ├── internal/
-│   ├── sipua/              # SIP 协议栈
-│   │   ├── message.go      # parse / build / Headers
-│   │   ├── auth.go         # Digest auth
-│   │   ├── transport.go    # UDP / TLS transport
-│   │   └── uac.go          # UAC helper
-│   ├── sdp/                # SDP 构造与解析
-│   │   └── sdp.go
-│   └── media/              # RTP / 编码 / WAV / tone
-│       ├── codec.go        # G.711 alaw/ulaw
-│       ├── rtp.go          # RTPSession 收发
-│       ├── tone.go         # 正弦波合成
-│       └── wav.go          # WAV 读写
-└── examples/               # 一键 demo 脚本
-    ├── invite-tls.sh
+│   ├── sipua/                  # SIP protocol stack
+│   ├── sdp/                    # SDP construction & parsing
+│   ├── media/                  # RTP / codec / WAV / tone / DTMF
+│   ├── report/                 # signaling recorder + HTML report
+│   ├── clui/                   # CLI visual layer
+│   └── logsink/                # log rotation + failure-only buffer
+└── examples/                   # one-shot demo scripts
+    ├── options-udp.sh
     ├── register-udp.sh
+    ├── invite-tls.sh
     └── listen-uas.sh
 ```
 
 ## License
 
-内部工具,跟 dh-ss / dh-sbc 同 license。
+MIT — see [LICENSE](LICENSE).

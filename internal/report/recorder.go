@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"html"
 	"html/template"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -84,6 +85,11 @@ type Recorder struct {
 	failedDropped int64         // 因 MaxFailedKept 上限被 drop 的失败通数
 	totalCalls    int64         // 见过的所有 Call-ID 总数(含已 drop 的成功 / 已 drop 的失败)
 
+	// wall durations 用于 HTML report 直方图;cap=MaxWallSamples 防压测下无界增长
+	// (达上限后丢弃新样本,直方图仍代表前 N 通的分布)。
+	wallDurs       []time.Duration
+	MaxWallSamples int
+
 	// LogCtrl 可选钩子 — 收到 INVITE final 时通知日志层 flush(失败通)/ drop(成功通)缓存。
 	// 配合 logsink.BufHandler 的 --log-only-failed 模式;为 nil 时全 noop。
 	LogCtrl LogController
@@ -107,6 +113,21 @@ type Snapshot struct {
 	Fail    int64
 	Pending int64           // 见过但没拿到 final 的 callid 数(活跃通)
 	Status  map[int]int64   // status code → count(完整分布快照,caller 可读)
+}
+
+// AddWallDuration 记录一次完整呼叫的 wall duration(INVITE 起到 BYE 完)。
+// 用于 HTML report 直方图。达 MaxWallSamples 上限后新样本静默丢弃,直方图仍代表
+// 前 N 通的分布(压测下 N=100K 足够代表)。
+func (r *Recorder) AddWallDuration(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.MaxWallSamples > 0 && len(r.wallDurs) >= r.MaxWallSamples {
+		return
+	}
+	r.wallDurs = append(r.wallDurs, d)
 }
 
 // Snapshot 取当前统计,线程安全。Status map 是 defensive copy,caller 修改不回写。
@@ -139,6 +160,7 @@ func New(subcmd, title string) *Recorder {
 		statusCount:    map[int]int64{},
 		successByCode:  map[int]int64{},
 		KeepOnlyFailed: true,
+		MaxWallSamples: 100_000,
 		MaxFailedKept:  50,
 		Title:          title,
 		Subcmd:         subcmd,
@@ -440,6 +462,14 @@ type reportView struct {
 	PendingCount   int64
 	StatRows       []statRow
 
+	// 图表数据(SVG inline render 用)
+	PieSVG    template.HTML // 状态码饼图
+	HistSVG   template.HTML // wall time 直方图
+	HistN     int           // 直方图样本数
+	HistP50   string
+	HistP95   string
+	HistP99   string
+
 	// 详情控制
 	KeepOnlyFailed bool
 	MaxFailedKept  int
@@ -488,6 +518,19 @@ func buildView(r *Recorder, calls []*Call) reportView {
 			Code: 0, Reason: "no final (timeout / aborted)", Count: v.PendingCount, Cls: "pending",
 		})
 	}
+
+	// 图表渲染:饼图(status 分布)+ 直方图(wall durations)
+	v.PieSVG = renderStatusPie(v.StatRows)
+	r.mu.Lock()
+	wallCopy := make([]time.Duration, len(r.wallDurs))
+	copy(wallCopy, r.wallDurs)
+	r.mu.Unlock()
+	hSVG, hN, hP50, hP95, hP99 := renderWallHist(wallCopy)
+	v.HistSVG = hSVG
+	v.HistN = hN
+	v.HistP50 = hP50
+	v.HistP95 = hP95
+	v.HistP99 = hP99
 
 	// 详情区:已经在 r.calls 里的(失败保留前 MaxFailedKept 条 + 所有 pending)
 	for i, c := range calls {
@@ -541,6 +584,194 @@ func buildView(r *Recorder, calls []*Call) reportView {
 		v.Calls = append(v.Calls, cv)
 	}
 	return v
+}
+
+// renderStatusPie 把 status code 分布渲染成 SVG 饼图(全量累计,与 StatRows 同源)。
+// 200x200 viewBox,中心 (100,100),半径 80。颜色按 2xx 绿 / ≥300 红 / 0 灰梯度。
+// 计算 cumulative angle,每片用一个 path d="M cx cy L x1 y1 A r r 0 large 1 x2 y2 Z"。
+func renderStatusPie(rows []statRow) template.HTML {
+	if len(rows) == 0 {
+		return ""
+	}
+	var total int64
+	for _, r := range rows {
+		total += r.Count
+	}
+	if total <= 0 {
+		return ""
+	}
+	// 2xx 用渐变绿,≥300 用渐变红,pending(0)用灰
+	greens := []string{"#34C759", "#2EB04E", "#27993E", "#1F7E32"}
+	reds := []string{"#C00000", "#9C0000", "#7A0000", "#5A0000", "#3D0000"}
+	gi, ri := 0, 0
+	type slice struct {
+		Label string
+		Count int64
+		Color string
+	}
+	slices := make([]slice, 0, len(rows))
+	for _, row := range rows {
+		s := slice{Count: row.Count}
+		switch row.Cls {
+		case "ok":
+			s.Color = greens[gi%len(greens)]
+			gi++
+			s.Label = fmt.Sprintf("%d ✓", row.Code)
+		case "fail":
+			s.Color = reds[ri%len(reds)]
+			ri++
+			s.Label = fmt.Sprintf("%d", row.Code)
+		case "pending":
+			s.Color = "#888"
+			s.Label = "pending"
+		default:
+			s.Color = "#bbb"
+			s.Label = "?"
+		}
+		slices = append(slices, s)
+	}
+
+	const cx, cy, r = 100.0, 100.0, 80.0
+	var b strings.Builder
+	b.WriteString(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 200" class="pie">`)
+	// 饼图本体在 0..200,右侧 200..360 是 legend
+	cumAngle := -math.Pi / 2 // 从顶部 12 点起
+	for _, s := range slices {
+		frac := float64(s.Count) / float64(total)
+		angle := 2 * math.Pi * frac
+		x1 := cx + r*math.Cos(cumAngle)
+		y1 := cy + r*math.Sin(cumAngle)
+		cumAngle += angle
+		x2 := cx + r*math.Cos(cumAngle)
+		y2 := cy + r*math.Sin(cumAngle)
+		large := 0
+		if angle > math.Pi {
+			large = 1
+		}
+		// 整圆特殊处理(单一类别 100%)— path 退化,改画完整 circle
+		if frac >= 0.999 {
+			fmt.Fprintf(&b, `<circle cx="%.1f" cy="%.1f" r="%.1f" fill="%s"/>`, cx, cy, r, s.Color)
+			break
+		}
+		fmt.Fprintf(&b, `<path d="M %.1f %.1f L %.1f %.1f A %.1f %.1f 0 %d 1 %.1f %.1f Z" fill="%s"/>`,
+			cx, cy, x1, y1, r, r, large, x2, y2, s.Color)
+	}
+	// legend
+	ly := 30
+	for _, s := range slices {
+		frac := float64(s.Count) * 100 / float64(total)
+		fmt.Fprintf(&b, `<rect x="210" y="%d" width="12" height="12" fill="%s"/>`, ly, s.Color)
+		fmt.Fprintf(&b, `<text x="230" y="%d" class="lg-lbl">%s</text>`, ly+10, htmlEscape(s.Label))
+		fmt.Fprintf(&b, `<text x="290" y="%d" class="lg-cnt">%d  (%.0f%%)</text>`, ly+10, s.Count, frac)
+		ly += 22
+		if ly > 180 {
+			break
+		}
+	}
+	b.WriteString(`</svg>`)
+	return template.HTML(b.String())
+}
+
+// renderWallHist 把 wallDurs 渲染成直方图(20 bins,linear scale)+ p50/p95 标注。
+// 返回 (svg, n, p50, p95, p99)。n=0 时返回空 svg。
+func renderWallHist(durs []time.Duration) (template.HTML, int, string, string, string) {
+	n := len(durs)
+	if n == 0 {
+		return "", 0, "—", "—", "—"
+	}
+	sorted := make([]time.Duration, n)
+	copy(sorted, durs)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	p50 := sorted[n*50/100]
+	p95 := sorted[n*95/100]
+	p99 := sorted[n*99/100]
+	if p99 == 0 && n > 0 {
+		p99 = sorted[n-1]
+	}
+	// bin 边界:取 min ~ p99 范围(去掉极端长尾,看主分布)
+	lo := sorted[0]
+	hi := p99
+	if hi <= lo {
+		hi = sorted[n-1]
+	}
+	if hi <= lo {
+		hi = lo + time.Millisecond
+	}
+	const bins = 20
+	span := hi - lo
+	binW := span / bins
+	if binW <= 0 {
+		binW = time.Millisecond
+	}
+	counts := make([]int, bins)
+	for _, d := range sorted {
+		idx := int((d - lo) / binW)
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= bins {
+			idx = bins - 1
+		}
+		counts[idx]++
+	}
+	maxC := 0
+	for _, c := range counts {
+		if c > maxC {
+			maxC = c
+		}
+	}
+	if maxC == 0 {
+		maxC = 1
+	}
+	// SVG 600x180 (含 axis 留白)
+	const W, H = 600.0, 180.0
+	const padL, padR, padT, padB = 40.0, 20.0, 12.0, 30.0
+	plotW := W - padL - padR
+	plotH := H - padT - padB
+	barW := plotW / bins
+	var b strings.Builder
+	b.WriteString(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 180" class="hist">`)
+	// y axis ticks (0, max)
+	fmt.Fprintf(&b, `<text x="%.1f" y="%.1f" class="ax-lbl">%d</text>`, 4.0, padT+10, maxC)
+	fmt.Fprintf(&b, `<text x="%.1f" y="%.1f" class="ax-lbl">0</text>`, 4.0, padT+plotH+4)
+	// bars
+	for i, c := range counts {
+		bh := float64(c) / float64(maxC) * plotH
+		x := padL + float64(i)*barW
+		y := padT + plotH - bh
+		fmt.Fprintf(&b, `<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" class="bar"/>`, x, y, barW-1, bh)
+	}
+	// p50 / p95 lines
+	p50x := padL + float64(p50-lo)/float64(binW*bins)*plotW
+	p95x := padL + float64(p95-lo)/float64(binW*bins)*plotW
+	if p50x < padL {
+		p50x = padL
+	}
+	if p50x > padL+plotW {
+		p50x = padL + plotW
+	}
+	if p95x < padL {
+		p95x = padL
+	}
+	if p95x > padL+plotW {
+		p95x = padL + plotW
+	}
+	fmt.Fprintf(&b, `<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" class="pline p50"/>`, p50x, padT, p50x, padT+plotH)
+	fmt.Fprintf(&b, `<text x="%.1f" y="%.1f" class="pmark">p50 %s</text>`, p50x+3, padT+10, p50.Round(time.Millisecond).String())
+	fmt.Fprintf(&b, `<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" class="pline p95"/>`, p95x, padT, p95x, padT+plotH)
+	fmt.Fprintf(&b, `<text x="%.1f" y="%.1f" class="pmark">p95 %s</text>`, p95x+3, padT+24, p95.Round(time.Millisecond).String())
+	// x axis labels (lo / hi)
+	fmt.Fprintf(&b, `<text x="%.1f" y="%.1f" class="ax-lbl">%s</text>`, padL, H-padB+18, lo.Round(time.Millisecond).String())
+	fmt.Fprintf(&b, `<text x="%.1f" y="%.1f" class="ax-lbl" text-anchor="end">%s</text>`, padL+plotW, H-padB+18, hi.Round(time.Millisecond).String())
+	b.WriteString(`</svg>`)
+	return template.HTML(b.String()), n,
+		p50.Round(time.Millisecond).String(),
+		p95.Round(time.Millisecond).String(),
+		p99.Round(time.Millisecond).String()
+}
+
+func htmlEscape(s string) string {
+	return template.HTMLEscapeString(s)
 }
 
 // reasonFor 把常见 SIP status code 映射成简短理由字符串(只覆盖最常见的)。
@@ -788,6 +1019,21 @@ table.events th { font-weight:600; color:var(--muted); font-family:-apple-system
 .ladder .ev-label.fail { fill:var(--fail); }
 .ladder .ev-time { font-family:Menlo,Consolas,monospace; font-size:10px; fill:#888; }
 .empty { padding:32px; text-align:center; color:var(--muted); }
+.charts { display:grid; grid-template-columns:380px 1fr; gap:16px; margin:12px 0 20px; }
+.chart-card { background:white; padding:12px 16px; border-radius:8px; box-shadow:0 1px 2px rgba(0,0,0,.06); }
+.chart-card h3 { font-size:13px; font-weight:600; margin:0 0 8px; color:#444; }
+.chart-card .sub { font-size:11px; color:var(--muted); font-family:Menlo,Consolas,monospace; margin-bottom:6px; }
+.pie { width:100%; height:auto; max-height:200px; }
+.pie .lg-lbl { font-family:Menlo,Consolas,monospace; font-size:11px; fill:#222; dominant-baseline:middle; }
+.pie .lg-cnt { font-family:Menlo,Consolas,monospace; font-size:11px; fill:#666; dominant-baseline:middle; }
+.hist { width:100%; height:auto; max-height:200px; }
+.hist .bar { fill:var(--primary); fill-opacity:.72; }
+.hist .pline { stroke-width:1; stroke-dasharray:3 3; }
+.hist .pline.p50 { stroke:var(--ok); }
+.hist .pline.p95 { stroke:#FFCB66; }
+.hist .pmark { font-family:Menlo,Consolas,monospace; font-size:10px; fill:#222; }
+.hist .ax-lbl { font-family:Menlo,Consolas,monospace; font-size:10px; fill:var(--muted); }
+@media (max-width: 900px) { .charts { grid-template-columns: 1fr; } }
 </style>
 </head><body>
 <header>
@@ -802,9 +1048,28 @@ table.events th { font-weight:600; color:var(--muted); font-family:-apple-system
 <div class="card pending"><div class="num">{{.PendingCount}}</div><div class="lbl">无 final</div></div>
 </section>
 
+{{if or .PieSVG .HistSVG}}
+<section class="charts">
+{{if .PieSVG}}
+<div class="chart-card">
+<h3>Status code distribution</h3>
+<div class="sub">slice = code · legend shows count and percent</div>
+{{.PieSVG}}
+</div>
+{{end}}
+{{if .HistSVG}}
+<div class="chart-card">
+<h3>Wall time distribution</h3>
+<div class="sub">n = {{.HistN}}  ·  p50 {{.HistP50}}  ·  p95 {{.HistP95}}  ·  p99 {{.HistP99}}  ·  range trimmed at p99</div>
+{{.HistSVG}}
+</div>
+{{end}}
+</section>
+{{end}}
+
 {{if .StatRows}}
 <section class="stat-table">
-<h3>Status code 分布</h3>
+<h3>Status code table</h3>
 <table><thead><tr><th>code</th><th>reason</th><th>count</th></tr></thead><tbody>
 {{range .StatRows}}<tr><td class="col-status {{.Cls}}">{{if eq .Code 0}}—{{else}}{{.Code}}{{end}}</td><td>{{.Reason}}</td><td>{{.Count}}</td></tr>{{end}}
 </tbody></table>
