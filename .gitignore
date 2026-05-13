@@ -1,0 +1,27 @@
+# build artifacts
+bin/
+outputs/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# logs / runtime
+*.log
+dsipper-*.log
+dsipper-*.log.old
+*.wav
+*.pcap
+
+# editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# project memory (Claude Code symlink to ~/.claude/projects/<encoded>/memory/)
+claude-memory
+.claude/
+
+# old git history backup before open-sourcing
+.git-pre-opensource-backup-*
