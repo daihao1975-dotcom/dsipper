@@ -60,12 +60,12 @@ func (d *dialogTable) cancelAll() {
 func Listen(args []string) {
 	fs := flag.NewFlagSet("listen", flag.ExitOnError)
 	transport := fs.String("transport", "udp", "udp / tls")
-	bind := fs.String("bind", "0.0.0.0:5060", "监听 host:port")
+	bind := fs.String("bind", "127.0.0.1:5060", "监听 host:port(默认 loopback,避免无意暴露;真接外网用 0.0.0.0:5060)")
 	cert := fs.String("cert", "", "TLS server 证书 (transport=tls 必填)")
 	key := fs.String("key", "", "TLS 私钥 (transport=tls 必填)")
 	codecName := fs.String("codec", "PCMA", "回送 codec PCMA / PCMU")
 	tone := fs.Float64("tone", 880, "回送正弦波频率 Hz (与主叫不同方便区分)")
-	saveRecv := fs.String("save-recv", "", "把每通呼叫收到的 RTP 落 WAV (前缀,如 'rx',会写 rx-N.wav)")
+	saveRecv := fs.String("save-recv", "", "把每通呼叫收到的 RTP 落 WAV(前缀,如 'rx' → rx-N.wav;空 / 'off' = 不保存,默认)")
 	byeAfter := fs.Duration("bye-after", 0, "UAS 在答 200 OK 后 N 秒主动发 BYE (0=不主动 BYE,只回响应)")
 	noRTP := fs.Bool("no-rtp", false, "信令 only 模式:跳过 RTP socket / SDP answer / 媒体协程,只回纯 200 OK + 等 BYE(用于 cps 压测)")
 	enableUI := fs.Bool("ui", false, "stderr 显示实时统计面板(total / ok / fail / active / cps)")
@@ -74,11 +74,16 @@ func Listen(args []string) {
 	logMaxMB := fs.Int("log-max-mb", 100, "单日志文件 size 上限 MB,达上限 rename 到 .log.old 重开(0=不滚动)")
 	logOnlyFailed := fs.Bool("log-only-failed", false, "只落失败通日志:含 call-id 的日志先 buffer,2xx 时丢弃,>=300 / 退出 pending 时才 flush")
 	tlsKeepalive := fs.Duration("tls-keepalive", 0, "TLS 长连接每隔 N 发 \\r\\n\\r\\n 心跳(RFC 5626);0=关")
+	fs.BoolVar(&Quiet, "quiet", false, "静默模式:不打 logo / config box / 'log → ...' 提示")
 	reportPath := fs.String("report", "", "退出时把所有接到的呼叫信令落一份 HTML report 到该路径(目录或具体 .html);空=不生成")
 	reportMaxFailed := fs.Int("report-max-failed", 50, "HTML 详情区保留多少条失败通的信令图(成功不展示);超出只计入顶部汇总")
 	pcapOpts := AttachPcap(fs)
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
+	}
+	// "off" 关键字与空字符串等价
+	if strings.EqualFold(*saveRecv, "off") || strings.EqualFold(*saveRecv, "none") {
+		*saveRecv = ""
 	}
 	log, bufH := co(*verbose, *logFile, "listen", *logMaxMB, *logOnlyFailed, *enableUI)
 
@@ -659,8 +664,10 @@ func co(v int, path, subcmd string, maxMB int, onlyFailed bool, panelMode bool) 
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "WARN: open log %s: %v (fallback stderr only)\n", p, err)
 		} else {
-			fmt.Fprintf(os.Stderr, "log → %s (rotate at %d MB)\n", p, maxMB)
-			if panelMode {
+			if !Quiet {
+				fmt.Fprintf(os.Stderr, "log → %s (rotate at %d MB)\n", p, maxMB)
+			}
+			if panelMode || Quiet {
 				out = rf
 			} else {
 				out = io.MultiWriter(os.Stderr, rf)

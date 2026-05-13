@@ -42,7 +42,7 @@ func NewUAC(t Transport, server, localIP string, log *slog.Logger) *UAC {
 	return &UAC{
 		T:         t,
 		Log:       log,
-		UserAgent: "dsipper/0.9",
+		UserAgent: "dsipper/0.10",
 		LocalIP:   localIP,
 		CallID:    randID(16) + "@" + localIP,
 		FromTag:   randID(8),
@@ -208,7 +208,7 @@ func buildSimpleResponse(req *Message, code int, reason string) *Message {
 			r.Headers.Add(h, v)
 		}
 	}
-	r.Headers.Add("User-Agent", "dsipper-uac/0.9")
+	r.Headers.Add("User-Agent", "dsipper-uac/0.10")
 	return r
 }
 

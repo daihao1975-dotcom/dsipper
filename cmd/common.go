@@ -20,9 +20,17 @@ import (
 // Version 由 main 在 init 时设置,banner 渲染用。
 var Version = "dev"
 
+// Quiet 全局静默旗:caller 在解析 --quiet 后置 true → Banner 不打印 logo + config box,
+// MakeLogger 也不再向 stderr 打 "log → ..." 提示。CI / 脚本用户友好。
+var Quiet = false
+
 // Banner 在 subcmd 入口打印阿屠宰风 logo + 配置摘要 box 到 stderr。
 // kvs 已是渲染后的字符串(带色 / 高亮 caller 自己加)。
+// Quiet=true 时直接 noop(给 CI / 脚本场景)。
 func Banner(subcmd string, kvs []clui.KV) {
+	if Quiet {
+		return
+	}
 	fmt.Fprint(os.Stderr, clui.Logo(Version, subcmd))
 	fmt.Fprint(os.Stderr, clui.BannerBox(subcmd+" — config", kvs))
 }
@@ -87,6 +95,7 @@ func AttachCommon(fs *flag.FlagSet) *CommonOpts {
 	fs.IntVar(&o.LogMaxMB, "log-max-mb", 100, "单日志文件 size 上限 MB,达上限 rename 到 .log.old 重开(0=不滚动)")
 	fs.BoolVar(&o.LogOnlyFailed, "log-only-failed", false, "只落失败通日志:含 call-id 的日志先 buffer,呼叫拿到 2xx 时丢弃,>=300 / 退出 pending 时才 flush")
 	fs.DurationVar(&o.TLSKeepalive, "tls-keepalive", 0, "TLS 长连接每隔 N 发 \\r\\n\\r\\n 心跳(RFC 5626);0=关。建议 30-60s 防 SBC/NAT 拆链")
+	fs.BoolVar(&Quiet, "quiet", false, "静默模式:不打 logo / config box / 'log → ...' 提示;CI 友好")
 	return o
 }
 
@@ -131,9 +140,11 @@ func buildLogger(o *CommonOpts, subcmd string) *slog.Logger {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "WARN: open log %s: %v (fallback stderr only)\n", path, err)
 		} else {
-			fmt.Fprintf(os.Stderr, "log → %s (rotate at %d MB)\n", path, o.LogMaxMB)
-			if o.PanelMode {
-				// LivePanel 占 stderr,日志只落文件,防多行面板被 log 撞乱
+			if !Quiet {
+				fmt.Fprintf(os.Stderr, "log → %s (rotate at %d MB)\n", path, o.LogMaxMB)
+			}
+			if o.PanelMode || Quiet {
+				// LivePanel 占 stderr 时日志只落文件;Quiet 模式同理(stderr 静默)
 				out = rf
 			} else {
 				out = io.MultiWriter(os.Stderr, rf)

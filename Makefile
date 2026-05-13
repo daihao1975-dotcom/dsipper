@@ -1,6 +1,6 @@
 BINARY  := dsipper
 PKG     := dsipper
-VERSION := 0.9.0
+VERSION ?= 0.10.0
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .PHONY: all build build-mac build-linux-amd64 build-linux-arm64 cross clean test fmt

@@ -72,8 +72,11 @@ func main() {
 		cmd.Listen(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
+	case "--version", "version":
+		// 不接 -v(避免跟子命令的 -v verbose level 短 flag 冲突)
+		fmt.Printf("dsipper %s\n", version)
 	default:
-		fmt.Fprintf(os.Stderr, "未知命令: %s\n\n%s", os.Args[1], usage)
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n%s", os.Args[1], usage)
 		os.Exit(2)
 	}
 }

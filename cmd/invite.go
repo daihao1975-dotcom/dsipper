@@ -35,7 +35,7 @@ func Invite(args []string) {
 	wavFile := fs.String("wav", "", "发送 WAV 文件 (16-bit mono 8kHz);为空则发 440Hz 正弦波")
 	tone := fs.Float64("tone", 440, "正弦波频率 Hz (--wav 留空时生效)")
 	duration := fs.Duration("duration", 10*time.Second, "通话总时长")
-	saveRecv := fs.String("save-recv", "recv.wav", "把收到的 RTP 解码后保存为 WAV;空字符串=不保存(stress 模式下若非空会加 -NNNN 序号后缀)")
+	saveRecv := fs.String("save-recv", "", "把收到的 RTP 解码后保存为 WAV(空=不保存,默认;'off' 同样表示不保存;stress 模式下非空会加 -NNNN 序号后缀)")
 	timeout := fs.Duration("timeout", 10*time.Second, "INVITE 单事务超时")
 	rtpPortMin := fs.Int("rtp-port-min", 0, "RTP 本地端口下界 (与 --rtp-port-max 同时 >0 时启用)")
 	rtpPortMax := fs.Int("rtp-port-max", 0, "RTP 本地端口上界")
@@ -66,6 +66,10 @@ func Invite(args []string) {
 	if *to == "" {
 		fmt.Fprintln(os.Stderr, "ERR: --to 必填")
 		os.Exit(2)
+	}
+	// "off" 关键字与空字符串等价 — 让 CLI 用户写 --save-recv off 比 --save-recv "" 直觉
+	if strings.EqualFold(*saveRecv, "off") || strings.EqualFold(*saveRecv, "none") {
+		*saveRecv = ""
 	}
 	if *total < 1 {
 		*total = 1
