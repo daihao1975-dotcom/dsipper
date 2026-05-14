@@ -63,6 +63,7 @@ func Listen(args []string) {
 	cert := fs.String("cert", "", "TLS/WSS server 证书 (transport=tls/wss 必填)")
 	key := fs.String("key", "", "TLS/WSS 私钥 (transport=tls/wss 必填)")
 	wsPath := fs.String("ws-path", "/", "SIP-over-WebSocket 路径(transport=ws/wss 生效;RFC 7118)")
+	wsOrigins := fs.String("ws-allowed-origins", "", "WS/WSS server Origin 白名单,逗号分隔(支持 * 通配);空=接受所有 Origin 并打 warn")
 	codecName := fs.String("codec", "PCMA", "回送 codec PCMA / PCMU")
 	tone := fs.Float64("tone", 880, "回送正弦波频率 Hz (与主叫不同方便区分)")
 	saveRecv := fs.String("save-recv", "", "把每通呼叫收到的 RTP 落 WAV(前缀,如 'rx' → rx-N.wav;空 / 'off' = 不保存,默认)")
@@ -78,9 +79,16 @@ func Listen(args []string) {
 	fs.BoolVar(&Quiet, "quiet", false, "静默模式:不打 logo / config box / 'log → ...' 提示")
 	reportPath := fs.String("report", "", "退出时把所有接到的呼叫信令落一份 HTML report 到该路径(目录或具体 .html);空=不生成")
 	reportMaxFailed := fs.Int("report-max-failed", 50, "HTML 详情区保留多少条失败通的信令图(成功不展示);超出只计入顶部汇总")
+	maxConcurrent := fs.Int("max-concurrent", 1024, "并发 in-flight 呼叫上限,超出新 INVITE 直接 503;防 goroutine/FD 耗尽")
 	pcapOpts := AttachPcap(fs)
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
+	}
+	if *maxConcurrent < 1 {
+		*maxConcurrent = 1
+	}
+	if *maxConcurrent > 100000 {
+		*maxConcurrent = 100000
 	}
 	// "off" 关键字与空字符串等价
 	if strings.EqualFold(*saveRecv, "off") || strings.EqualFold(*saveRecv, "none") {
@@ -106,16 +114,21 @@ func Listen(args []string) {
 		}
 		t, err = sipua.NewTLSServer(*bind, sipua.TLSOptions{CertFile: *cert, KeyFile: *key})
 	case "ws":
-		t, err = sipua.NewWSServer(false, sipua.WSOptions{ListenAddr: *bind, Path: *wsPath})
+		t, err = sipua.NewWSServer(false, sipua.WSOptions{
+			ListenAddr:     *bind,
+			Path:           *wsPath,
+			AllowedOrigins: splitCSV(*wsOrigins),
+		})
 	case "wss":
 		if *cert == "" || *key == "" {
 			fmt.Fprintln(os.Stderr, "ERR: WSS 模式需要 --cert / --key")
 			os.Exit(2)
 		}
 		t, err = sipua.NewWSServer(true, sipua.WSOptions{
-			ListenAddr: *bind,
-			Path:       *wsPath,
-			TLSServer:  sipua.TLSOptions{CertFile: *cert, KeyFile: *key},
+			ListenAddr:     *bind,
+			Path:           *wsPath,
+			TLSServer:      sipua.TLSOptions{CertFile: *cert, KeyFile: *key},
+			AllowedOrigins: splitCSV(*wsOrigins),
 		})
 	default:
 		fmt.Fprintln(os.Stderr, "ERR: --transport udp/tls/ws/wss")
@@ -213,6 +226,10 @@ func Listen(args []string) {
 	dt := newDialogTable()
 	var wg sync.WaitGroup
 
+	// in-flight 信号量:Acquire 失败 → 直接 503,防止 INVITE 洪泛把进程拖垮。
+	// 容量 = max-concurrent。slot 在 handleIncomingCall 退出时释放。
+	sem := make(chan struct{}, *maxConcurrent)
+
 	defer func() {
 		dt.cancelAll() // 主退出时联动取消所有 in-flight dialog
 		wg.Wait()      // 等 handler 走完 dump
@@ -263,9 +280,20 @@ func Listen(args []string) {
 				if *noRTP {
 					handleIncomingCallSignalingOnly(t, in, m, log, dt, rep)
 				} else {
+					// 非阻塞 acquire:满了立刻 503 拒绝,防 goroutine/FD 耗尽
+					select {
+					case sem <- struct{}{}:
+					default:
+						replyStatus(t, in, m, 503, "Service Unavailable", rep)
+						log.Warn("max-concurrent reached, rejecting INVITE",
+							"limit", *maxConcurrent,
+							"call-id", m.Headers.Get("Call-ID"))
+						continue
+					}
 					wg.Add(1)
 					go func(idx int, inb sipua.Inbound, msg *sipua.Message) {
 						defer wg.Done()
+						defer func() { <-sem }()
 						handleIncomingCall(ctx, t, inb, msg, codecObj, *tone, *saveRecv, *byeAfter, *reliableRinging, idx, log, dt, rep)
 					}(callIdx, in, m)
 				}
@@ -734,6 +762,21 @@ func localIPForRemote(viaHeader string) string {
 	}
 	// fallback
 	return "127.0.0.1"
+}
+
+// splitCSV 把逗号分隔串切片,trim 后过滤空项。
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func signalContext() (context.Context, context.CancelFunc) {

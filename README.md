@@ -156,7 +156,7 @@ in-dialog **re-INVITE**, mirroring the offered SDP direction
 |---|---|---|
 | `--server` | Downstream host:port | (required) |
 | `--transport` | `udp` / `tls` | udp |
-| `--insecure` | TLS skip server cert verification (self-signed) | true |
+| `--insecure` | TLS skip server cert verification (self-signed); prints a stderr warning when on | false |
 | `--ca <file>` | Verify server cert against this CA (auto-disables `--insecure`) | (empty) |
 | `-v` | 0 = info / 1 = debug (logs the full SIP message body) | 0 |
 | `--log` | Log file path. Empty = auto `dsipper-<cmd>-<timestamp>.log`. `-` = stderr only | (empty) |
@@ -173,8 +173,9 @@ dsipper options --server sbc.example.com:5061 --transport tls \
                 --ca /etc/ssl/dh-ca.pem
 ```
 
-Without `--ca`, dsipper defaults to `InsecureSkipVerify` for easier self-signed
-debugging.
+As of v0.12, the default is **strict verification** — calls against self-signed
+SBCs must pass `--ca <pem>` or explicitly opt-in with `--insecure` (which prints
+a stderr warning every run).
 
 ## Stress mode flags (`invite`)
 

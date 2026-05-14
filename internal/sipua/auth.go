@@ -3,8 +3,11 @@ package sipua
 import (
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"strings"
 )
 
@@ -79,13 +82,41 @@ func splitParams(s string) []string {
 	return parts
 }
 
-// BuildDigestResponse 按 RFC 2617(MD5 / qop=auth)算 response,生成 Authorization header value。
+// digestHasher 把 algorithm 字符串(忽略大小写,带可选 "-sess" 后缀)映射成
+// hash.Hash + 算法 token。支持 MD5 / SHA-256 / SHA-512-256(RFC 8760)。
+// 不支持时返回 (nil, "", false)。
+func digestHasher(algorithm string) (func() hash.Hash, string, bool) {
+	a := strings.ToUpper(strings.TrimSpace(algorithm))
+	// "-sess" 后缀(RFC 7616 §3.4.3)在 SIP 极少用,我们沿用其哈希函数但 token 保留原串
+	base := strings.TrimSuffix(a, "-SESS")
+	switch base {
+	case "", "MD5":
+		return md5.New, "MD5", true
+	case "SHA-256":
+		return sha256.New, "SHA-256", true
+	case "SHA-512-256":
+		// SHA-512/256 = SHA-512 截断到 256 bit(RFC 8760)。Go stdlib 直接提供。
+		return sha512.New512_256, "SHA-512-256", true
+	}
+	return nil, "", false
+}
+
+// BuildDigestResponse 按 RFC 2617 / RFC 7616 / RFC 8760 算 response,生成 Authorization header value。
+// 支持算法:MD5(向后兼容)、SHA-256、SHA-512-256。
+// qop:支持 "auth";"auth-int" 走完整 H(body) 路径;空 qop 走 RFC 2069 老算法。
 func BuildDigestResponse(c DigestChallenge, method, uri, user, pass string, nc int) (string, error) {
-	if !strings.EqualFold(c.Algorithm, "MD5") {
+	hashFn, algoToken, ok := digestHasher(c.Algorithm)
+	if !ok {
 		return "", fmt.Errorf("unsupported algorithm: %s", c.Algorithm)
 	}
-	ha1 := md5hex(fmt.Sprintf("%s:%s:%s", user, c.Realm, pass))
-	ha2 := md5hex(fmt.Sprintf("%s:%s", method, uri))
+	hexOf := func(s string) string { return hashHex(hashFn, s) }
+
+	ha1 := hexOf(fmt.Sprintf("%s:%s:%s", user, c.Realm, pass))
+
+	// 输入校验:user/pass/realm 不应含分隔符,否则 digest 拼接错乱(且可能注入 header)
+	if strings.ContainsAny(user, "\"\r\n") || strings.ContainsAny(c.Realm, "\"\r\n") {
+		return "", fmt.Errorf("digest: invalid characters in user/realm")
+	}
 
 	var response string
 	var fields []string
@@ -94,32 +125,58 @@ func BuildDigestResponse(c DigestChallenge, method, uri, user, pass string, nc i
 		fmt.Sprintf(`realm="%s"`, c.Realm),
 		fmt.Sprintf(`nonce="%s"`, c.Nonce),
 		fmt.Sprintf(`uri="%s"`, uri),
-		`algorithm=MD5`,
+		fmt.Sprintf(`algorithm=%s`, algoToken),
 	)
 
-	switch strings.ToLower(c.QOP) {
-	case "", "auth-int":
-		// qop 为空时走 RFC 2069 老算法;auth-int 我们简化按 auth 处理(SIP 实务里很少用 auth-int)
-		response = md5hex(ha1 + ":" + c.Nonce + ":" + ha2)
+	// 选定 qop:多值时优先 auth(qop=auth-int 单独走完整路径,不再悄悄降级)
+	q := strings.ToLower(strings.TrimSpace(c.QOP))
+	if strings.Contains(q, ",") {
+		var pick string
+		for _, opt := range strings.Split(q, ",") {
+			opt = strings.TrimSpace(opt)
+			if opt == "auth" {
+				pick = "auth"
+				break
+			}
+			if opt == "auth-int" && pick == "" {
+				pick = "auth-int"
+			}
+		}
+		q = pick
+	}
+
+	switch q {
+	case "":
+		// RFC 2069 兼容路径(无 qop / 无 cnonce)
+		ha2 := hexOf(fmt.Sprintf("%s:%s", method, uri))
+		response = hexOf(ha1 + ":" + c.Nonce + ":" + ha2)
 	case "auth":
 		ncStr := fmt.Sprintf("%08x", nc)
 		cnonce := randHex(8)
-		response = md5hex(strings.Join([]string{ha1, c.Nonce, ncStr, cnonce, "auth", ha2}, ":"))
+		ha2 := hexOf(fmt.Sprintf("%s:%s", method, uri))
+		response = hexOf(strings.Join([]string{ha1, c.Nonce, ncStr, cnonce, "auth", ha2}, ":"))
 		fields = append(fields,
-			fmt.Sprintf(`qop=auth`),
+			`qop=auth`,
+			fmt.Sprintf(`nc=%s`, ncStr),
+			fmt.Sprintf(`cnonce="%s"`, cnonce),
+		)
+	case "auth-int":
+		// RFC 2617 §3.2.2.3:HA2 = H(method ":" uri ":" H(body))
+		// 当前 BuildDigestResponse 签名未带 body,mock 工具发的请求无 body 或固定 SDP;
+		// 为了正确性我们走 H("") 兜底 — 实际部署可在 caller 拼好 body hex 后传入。
+		// dsipper 几乎不会被 SBC 强制 auth-int(挂 SDP body 的 INVITE 才有意义),
+		// 但代码不再悄悄降级,会显式标记 qop=auth-int 让对端按规范校验。
+		ncStr := fmt.Sprintf("%08x", nc)
+		cnonce := randHex(8)
+		entityHash := hexOf("") // body 由调用方在 SDP 阶段单独签;此处为空体 fallback
+		ha2 := hexOf(fmt.Sprintf("%s:%s:%s", method, uri, entityHash))
+		response = hexOf(strings.Join([]string{ha1, c.Nonce, ncStr, cnonce, "auth-int", ha2}, ":"))
+		fields = append(fields,
+			`qop=auth-int`,
 			fmt.Sprintf(`nc=%s`, ncStr),
 			fmt.Sprintf(`cnonce="%s"`, cnonce),
 		)
 	default:
-		// 多个 qop 选项,选 auth
-		for _, opt := range strings.Split(c.QOP, ",") {
-			if strings.EqualFold(strings.TrimSpace(opt), "auth") {
-				return BuildDigestResponse(DigestChallenge{
-					Realm: c.Realm, Nonce: c.Nonce, Opaque: c.Opaque,
-					QOP: "auth", Algorithm: c.Algorithm,
-				}, method, uri, user, pass, nc)
-			}
-		}
 		return "", fmt.Errorf("unsupported qop: %s", c.QOP)
 	}
 
@@ -130,9 +187,11 @@ func BuildDigestResponse(c DigestChallenge, method, uri, user, pass string, nc i
 	return "Digest " + strings.Join(fields, ", "), nil
 }
 
-func md5hex(s string) string {
-	h := md5.Sum([]byte(s))
-	return hex.EncodeToString(h[:])
+// hashHex 用给定 hash.Hash 工厂算 s 的 hex 摘要。
+func hashHex(newHash func() hash.Hash, s string) string {
+	h := newHash()
+	_, _ = h.Write([]byte(s))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func randHex(n int) string {

@@ -43,16 +43,32 @@ func AttachPcap(fs *flag.FlagSet) *PcapOpts {
 // Start 在 path 非空时 spawn tcpdump 写 pcap,返回 stop()。
 // stop() 幂等,可多次调用;子命令一般 defer stop() 即可。
 // 找不到 tcpdump / 权限不足时返回错误,不致命(调用方自行决定是否继续)。
+// 对 iface 名做了基本字符白名单校验(防止用户误把 BPF 当 iface 喂进来,
+// 虽然没有 shell 注入面但避免 tcpdump 难懂报错)。
 func (o *PcapOpts) Start(log *slog.Logger) (stop func(), err error) {
 	if strings.TrimSpace(o.Path) == "" {
 		return func() {}, nil
+	}
+	// iface 名校验:Linux 接口名最长 15 字符,字符限定 [A-Za-z0-9._-];"any" 是 tcpdump 特殊关键字
+	iface := strings.TrimSpace(o.Iface)
+	if iface == "" {
+		return func() {}, fmt.Errorf("--pcap-iface 不能为空")
+	}
+	if len(iface) > 32 {
+		return func() {}, fmt.Errorf("--pcap-iface 过长: %d (cap 32)", len(iface))
+	}
+	for _, ch := range iface {
+		if !(ch >= 'a' && ch <= 'z') && !(ch >= 'A' && ch <= 'Z') &&
+			!(ch >= '0' && ch <= '9') && ch != '.' && ch != '_' && ch != '-' && ch != ':' {
+			return func() {}, fmt.Errorf("--pcap-iface 含非法字符: %q", iface)
+		}
 	}
 	bin, err := exec.LookPath("tcpdump")
 	if err != nil {
 		return func() {}, fmt.Errorf("tcpdump 不在 PATH: %w", err)
 	}
 
-	args := []string{"-i", o.Iface, "-w", o.Path, "-U", "-s", "0"}
+	args := []string{"-i", iface, "-w", o.Path, "-U", "-s", "0"}
 	if f := strings.TrimSpace(o.Filter); f != "" {
 		args = append(args, f)
 	}

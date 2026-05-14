@@ -2,6 +2,8 @@ package media
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -14,6 +16,17 @@ import (
 	"github.com/pion/rtp"
 	"github.com/pion/srtp/v3"
 )
+
+// secureUint32 用 crypto/rand 读一个 uint32 — 比 math/rand 不可预测,
+// 避免 SSRC/seq/ts 被外部攻击者预测后注入伪造 RTP。
+// crypto/rand 读失败时退回 math/rand,保证不会因熵不足而 panic。
+func secureUint32() uint32 {
+	var b [4]byte
+	if _, err := cryptorand.Read(b[:]); err == nil {
+		return binary.BigEndian.Uint32(b[:])
+	}
+	return rand.Uint32()
+}
 
 // RTPSession 是单个 RTP 双向会话(同一对 UDP 端口,接收 + 发送 共用)。
 type RTPSession struct {
@@ -114,12 +127,12 @@ func NewRTPSessionInRange(localIP string, portMin, portMax int, pt uint8, codecN
 func newSessionFromConn(conn *net.UDPConn, pt uint8, codecName string) *RTPSession {
 	return &RTPSession{
 		conn:      conn,
-		ssrc:      rand.Uint32(),
+		ssrc:      secureUint32(),
 		pt:        pt,
 		clockRate: 8000,
 		ptimeMs:   20,
-		seq:       uint16(rand.Intn(65535)),
-		ts:        rand.Uint32(),
+		seq:       uint16(secureUint32() & 0xFFFF),
+		ts:        secureUint32(),
 		dtmfPT:    101,
 		codecName: codecName,
 	}

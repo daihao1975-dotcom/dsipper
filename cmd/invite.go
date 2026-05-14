@@ -30,7 +30,8 @@ func Invite(args []string) {
 	to := fs.String("to", "", "Request-URI / To header,例如 sip:1000@sbc.example.com (必填)")
 	from := fs.String("from", "", "From URI,默认 sip:dsipper@<localip>")
 	user := fs.String("user", "", "Digest 用户名 (有 401 时使用)")
-	pass := fs.String("pass", "", "Digest 密码")
+	pass := fs.String("pass", "", "Digest 密码 (优先级: --pass > --pass-file > $DSIPPER_PASS)")
+	passFile := fs.String("pass-file", "", "从文件读 Digest 密码(首行;建议 chmod 600)")
 	codecName := fs.String("codec", "PCMA", "音频编码: PCMA / PCMU")
 	wavFile := fs.String("wav", "", "发送 WAV 文件 (16-bit mono 8kHz);为空则发 440Hz 正弦波")
 	tone := fs.Float64("tone", 440, "正弦波频率 Hz (--wav 留空时生效)")
@@ -77,15 +78,35 @@ func Invite(args []string) {
 		fmt.Fprintln(os.Stderr, "ERR: --to 必填")
 		os.Exit(2)
 	}
+	if resolvedPass, perr := ResolvePassword(*pass, *passFile); perr != nil {
+		fmt.Fprintf(os.Stderr, "ERR: %v\n", perr)
+		os.Exit(2)
+	} else {
+		*pass = resolvedPass
+	}
 	// "off" 关键字与空字符串等价 — 让 CLI 用户写 --save-recv off 比 --save-recv "" 直觉
 	if strings.EqualFold(*saveRecv, "off") || strings.EqualFold(*saveRecv, "none") {
 		*saveRecv = ""
 	}
+	// 防御性上界:避免 --total 2147483647 这种误操作把进程拉炸。
+	// 上界够大覆盖正常压测场景(1 千万呼叫 / 1 万并发 worker)。
+	const (
+		maxTotal       = 10_000_000
+		maxConcurrency = 10_000
+	)
 	if *total < 1 {
 		*total = 1
 	}
+	if *total > maxTotal {
+		fmt.Fprintf(os.Stderr, "ERR: --total %d exceeds cap %d\n", *total, maxTotal)
+		os.Exit(2)
+	}
 	if *concurrency < 1 {
 		*concurrency = 1
+	}
+	if *concurrency > maxConcurrency {
+		fmt.Fprintf(os.Stderr, "ERR: --concurrency %d exceeds cap %d\n", *concurrency, maxConcurrency)
+		os.Exit(2)
 	}
 	if *concurrency > *total {
 		*concurrency = *total

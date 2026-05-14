@@ -148,6 +148,13 @@ func defaultStr(s, d string) string {
 	return s
 }
 
+// maxHeaderValueBytes 是单个 header 值(含折叠续行累计)的硬上限。
+// 8KB 已足够覆盖最长合法 SIP header(Route 集合 / 多段 contacts);超出视为攻击。
+const maxHeaderValueBytes = 8 * 1024
+
+// maxRURIBytes 是 Request-URI 的硬上限。RFC 3261 无强制上限,2KB 已是真实部署极限。
+const maxRURIBytes = 2 * 1024
+
 // Parse 解析一条完整的 SIP message。raw 必须是 header+CRLFCRLF+body 完整体。
 // 不处理流式拆包,流层调用方负责按 Content-Length 切。
 func Parse(raw []byte) (*Message, error) {
@@ -187,28 +194,41 @@ func Parse(raw []byte) (*Message, error) {
 		if len(parts) < 3 {
 			return nil, fmt.Errorf("malformed request line: %q", first)
 		}
+		if len(parts[1]) > maxRURIBytes {
+			return nil, fmt.Errorf("RURI too long: %d bytes (cap %d)", len(parts[1]), maxRURIBytes)
+		}
 		m.IsRequest = true
 		m.Method = parts[0]
 		m.RURI = parts[1]
 		m.Version = parts[2]
 	}
 
-	// Headers (支持折叠行)
+	// Headers (支持折叠行,单 header 值上限 maxHeaderValueBytes 防 DoS)
 	var curName, curValue string
-	flush := func() {
+	flush := func() error {
 		if curName != "" {
+			if len(curValue) > maxHeaderValueBytes {
+				return fmt.Errorf("header %q value too long: %d bytes (cap %d)", curName, len(curValue), maxHeaderValueBytes)
+			}
 			m.Headers.Add(curName, strings.TrimSpace(curValue))
 		}
+		return nil
 	}
 	for _, line := range lines[1:] {
 		if line == "" {
 			continue
 		}
 		if line[0] == ' ' || line[0] == '\t' {
-			curValue += " " + strings.TrimSpace(line)
+			next := curValue + " " + strings.TrimSpace(line)
+			if len(next) > maxHeaderValueBytes {
+				return nil, fmt.Errorf("header %q folded value too long (cap %d)", curName, maxHeaderValueBytes)
+			}
+			curValue = next
 			continue
 		}
-		flush()
+		if err := flush(); err != nil {
+			return nil, err
+		}
 		colon := strings.IndexByte(line, ':')
 		if colon < 0 {
 			return nil, fmt.Errorf("malformed header: %q", line)
@@ -216,7 +236,9 @@ func Parse(raw []byte) (*Message, error) {
 		curName = line[:colon]
 		curValue = strings.TrimSpace(line[colon+1:])
 	}
-	flush()
+	if err := flush(); err != nil {
+		return nil, err
+	}
 
 	return m, nil
 }
