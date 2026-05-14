@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"math/rand"
 	"net"
@@ -647,12 +646,15 @@ func signalContext() (context.Context, context.CancelFunc) {
 // maxMB > 0 时文件 sink 走 logsink.RotatingFile(达上限滚 .old)。
 // onlyFailed=true 时返回的第二个值是 BufHandler,可挂到 recorder.LogCtrl,
 // 让 final 成功通的日志被丢弃,失败/退出 pending 才 flush。
+// co — listen 子命令独立的 logger 构造,跟 common.buildLogger 等价但参数序签名不同。
+// File sink = TextHandler(plain,grep 友好);stderr sink = ColorHandler;两路通过 MultiHandler。
 func co(v int, path, subcmd string, maxMB int, onlyFailed bool, panelMode bool) (*slog.Logger, *logsink.BufHandler) {
 	level := slog.LevelInfo
 	if v >= 1 {
 		level = slog.LevelDebug
 	}
-	var out io.Writer = os.Stderr
+
+	var fileH, stderrH slog.Handler
 	if path != "-" {
 		p := path
 		if p == "" {
@@ -667,18 +669,29 @@ func co(v int, path, subcmd string, maxMB int, onlyFailed bool, panelMode bool) 
 			if !Quiet {
 				fmt.Fprintf(os.Stderr, "log → %s (rotate at %d MB)\n", p, maxMB)
 			}
-			if panelMode || Quiet {
-				out = rf
-			} else {
-				out = io.MultiWriter(os.Stderr, rf)
-			}
+			fileH = slog.NewTextHandler(rf, &slog.HandlerOptions{Level: level})
 		}
 	}
-	inner := slog.NewTextHandler(out, &slog.HandlerOptions{Level: level})
+	if !panelMode && !Quiet {
+		stderrH = clui.NewColorHandler(os.Stderr, level)
+	}
+
+	var h slog.Handler
+	switch {
+	case fileH != nil && stderrH != nil:
+		h = clui.NewMultiHandler(stderrH, fileH)
+	case fileH != nil:
+		h = fileH
+	case stderrH != nil:
+		h = stderrH
+	default:
+		h = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	}
+
 	if onlyFailed {
-		bh := logsink.NewBufHandler(inner, true)
+		bh := logsink.NewBufHandler(h, true)
 		return slog.New(bh), bh
 	}
-	return slog.New(inner), nil
+	return slog.New(h), nil
 }
 

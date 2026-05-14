@@ -905,13 +905,22 @@ func runStress(log *slog.Logger, co *CommonOpts, rep *report.Recorder, pcm []int
 		{K: "p95 wall", V: p95.Round(time.Millisecond).String()},
 	}
 	if rep != nil {
-		if line := statusDistLine(rep.Snapshot().Status); line != "" {
-			rows = append(rows, clui.KV{K: "status", V: line})
+		// status dist 多行 wrap,每行 6 项,所有状态码都展示
+		for i, line := range statusDistLines(rep.Snapshot().Status, 6) {
+			k := "status"
+			if i > 0 {
+				k = "" // 续行 K 留空,视觉缩进
+			}
+			rows = append(rows, clui.KV{K: k, V: line})
 		}
 	}
-	// 错误 top-3(按 error 字符串聚合)
-	if errs := topErrors(errCounts.snapshot(), 3); errs != "" {
-		rows = append(rows, clui.KV{K: "err top", V: errs})
+	// 错误 top-3,每条独立一行,完整 error 不截断
+	for i, line := range topErrorLines(errCounts.snapshot(), 3) {
+		k := "err top"
+		if i > 0 {
+			k = ""
+		}
+		rows = append(rows, clui.KV{K: k, V: line})
 	}
 	fmt.Println(clui.BannerBox("stress summary", rows))
 
@@ -928,11 +937,25 @@ func stressCPSStrPlain(c float64) string {
 	return fmt.Sprintf("%.1f", c)
 }
 
-// statusDistLine 把 status code → count 渲染成 inline 串("200 ✓ 25  486 ✗ 3  503 ✗ 1")。
-// 2xx 绿勾,≥300 红叉,1xx 灰点。按 count 降序,最多展示 6 项。
+// statusDistLine 把 status code → count 渲染成单行串("200 ✓ 25  486 ✗ 3  503 ✗ 1")。
+// 仅给 LivePanel 用(单行 KV)— summary box 用 statusDistLines 多行 wrap。
 func statusDistLine(st map[int]int64) string {
-	if len(st) == 0 {
+	lines := statusDistLines(st, 6)
+	if len(lines) == 0 {
 		return ""
+	}
+	return lines[0]
+}
+
+// statusDistLines 把 status code 分布 wrap 成多行 string,每行最多 perRow 项,
+// 按 count 降序排列。给 summary box(允许多行)用,不截断任何状态码。
+// 2xx 绿勾,≥300 红叉,1xx 灰点。
+func statusDistLines(st map[int]int64, perRow int) []string {
+	if len(st) == 0 {
+		return nil
+	}
+	if perRow < 1 {
+		perRow = 6
 	}
 	type kv struct {
 		code int
@@ -943,27 +966,33 @@ func statusDistLine(st map[int]int64) string {
 		pairs = append(pairs, kv{c, n})
 	}
 	sort.Slice(pairs, func(i, j int) bool { return pairs[i].cnt > pairs[j].cnt })
-	if len(pairs) > 6 {
-		pairs = pairs[:6]
-	}
-	var b strings.Builder
-	for i, p := range pairs {
-		if i > 0 {
-			b.WriteString("  ")
+
+	lines := make([]string, 0, (len(pairs)+perRow-1)/perRow)
+	for chunk := 0; chunk < len(pairs); chunk += perRow {
+		end := chunk + perRow
+		if end > len(pairs) {
+			end = len(pairs)
 		}
-		sym, color := "·", clui.Slate
-		switch {
-		case p.code >= 200 && p.code < 300:
-			sym, color = "✓", clui.Green
-		case p.code >= 300:
-			sym, color = "✗", clui.Red
+		var b strings.Builder
+		for i, p := range pairs[chunk:end] {
+			if i > 0 {
+				b.WriteString("  ")
+			}
+			sym, color := "·", clui.Slate
+			switch {
+			case p.code >= 200 && p.code < 300:
+				sym, color = "✓", clui.Green
+			case p.code >= 300:
+				sym, color = "✗", clui.Red
+			}
+			b.WriteString(fmt.Sprintf("%s %s %s",
+				clui.Bold(color(fmt.Sprintf("%d", p.code))),
+				color(sym),
+				clui.Dim(fmt.Sprintf("%d", p.cnt))))
 		}
-		b.WriteString(fmt.Sprintf("%s %s %s",
-			clui.Bold(color(fmt.Sprintf("%d", p.code))),
-			color(sym),
-			clui.Dim(fmt.Sprintf("%d", p.cnt))))
+		lines = append(lines, b.String())
 	}
-	return b.String()
+	return lines
 }
 
 // errBucket 是 thread-safe 错误字符串计数器,workers 写入,panel/summary 读。
@@ -991,10 +1020,20 @@ func (b *errBucket) snapshot() map[string]int64 {
 	return out
 }
 
-// topErrors 把 err msg → count 排序后取 top N,渲染成 "msg×cnt; msg×cnt; ..."。
+// topErrors 把 err msg → count 排序后取 top N,渲染成单行串。LivePanel 用。
 func topErrors(m map[string]int64, n int) string {
-	if len(m) == 0 {
+	lines := topErrorLines(m, n)
+	if len(lines) == 0 {
 		return ""
+	}
+	return strings.Join(lines, clui.Dim("  ;  "))
+}
+
+// topErrorLines 取 top N 错误,每条独立一行,不截断长 error message。
+// 给 summary box 多行 wrap 用。
+func topErrorLines(m map[string]int64, n int) []string {
+	if len(m) == 0 {
+		return nil
 	}
 	type kv struct {
 		s   string
@@ -1008,15 +1047,11 @@ func topErrors(m map[string]int64, n int) string {
 	if len(pairs) > n {
 		pairs = pairs[:n]
 	}
-	parts := make([]string, 0, len(pairs))
+	lines := make([]string, 0, len(pairs))
 	for _, p := range pairs {
-		short := p.s
-		if len(short) > 36 {
-			short = short[:33] + "…"
-		}
-		parts = append(parts, fmt.Sprintf("%s%s", clui.Red(short), clui.Dim(fmt.Sprintf("×%d", p.cnt))))
+		lines = append(lines, fmt.Sprintf("%s%s", clui.Red(p.s), clui.Dim(fmt.Sprintf("  ×%d", p.cnt))))
 	}
-	return strings.Join(parts, clui.Dim("  ;  "))
+	return lines
 }
 
 func stressCPSStr(c float64) string {

@@ -6,6 +6,36 @@ All notable changes to **dsipper** are documented here. Versions follow
 
 ## [Unreleased]
 
+## [v0.11.0] — 2026-05-14
+
+### Added
+- **Colored slog handler** (`clui.NewColorHandler`) — every stderr log line
+  now reads at a glance: dim time, color-coded level, bold message, dim
+  `key=` + semantically colored value. `status` is green for 2xx and red
+  for ≥300; `call-id` gets truncated + dimmed since it's mostly noise;
+  `err` shows red; `call`, `codec`, `dir`, `remote-rtp` are each colored
+  to their role. File sinks still get plain `slog.NewTextHandler` output
+  so `grep` / `awk` keep working.
+- `clui.NewMultiHandler` — fan-out helper that routes a record to multiple
+  sub-handlers (colored stderr + plain file in dsipper's case).
+- **Long status / err lists wrap inside the summary box** instead of being
+  truncated. `statusDistLines(st, 6)` returns N lines of up to 6 codes
+  each (descending count); `topErrorLines(m, 3)` returns one line per
+  error reason with no string truncation.
+- **`test/regression.sh`** — 13-case end-to-end black-box regression
+  matrix (OPTIONS / REGISTER / INVITE single / DTMF rfc4733|inband|both /
+  re-INVITE hold / stress LivePanel / stress combined / all-fail err top /
+  listen --ui / HTML chart / parser fuzz 113 malformed packets). Each
+  case asserts on log markers + exit code; failure list summary at end.
+  Hook: `make test-regression` (builds first, then runs).
+
+### Changed
+- `buildLogger` (common) and `co` (listen) now build separate stderr +
+  file handlers and combine them with `MultiHandler` — replaces the old
+  `io.MultiWriter` trick that forced both sinks to share an encoding.
+- `statusDistLine` and `topErrors` kept as single-line wrappers for
+  LivePanel use; their `*Lines` siblings power the stress summary box.
+
 ## [v0.10.0] — 2026-05-14
 
 ### Added

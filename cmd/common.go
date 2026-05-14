@@ -5,7 +5,6 @@ package cmd
 import (
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -123,12 +122,24 @@ func (o *CommonOpts) MakeLogger(subcmd string) *slog.Logger {
 }
 
 // buildLogger 是 MakeLogger 的具体实现,listen 子命令也复用(它没走 CommonOpts)。
+//
+// Handler 配置矩阵:
+//
+//	         stderr 启用?       file 启用?
+//	 默认    ColorHandler        TextHandler   ← MultiHandler 路由两份
+//	 -log -  ColorHandler        —             单 stderr
+//	 PanelMode/Quiet  —          TextHandler   stderr 给 LivePanel/静默
+//
+// File 永远用 TextHandler(plain ANSI-free,grep 友好);stderr 永远用 ColorHandler。
 func buildLogger(o *CommonOpts, subcmd string) *slog.Logger {
 	level := slog.LevelInfo
 	if o.Verbose >= 1 {
 		level = slog.LevelDebug
 	}
-	var out io.Writer = os.Stderr
+
+	var fileH, stderrH slog.Handler
+
+	// File sink
 	if o.LogFile != "-" {
 		path := o.LogFile
 		if path == "" {
@@ -143,18 +154,31 @@ func buildLogger(o *CommonOpts, subcmd string) *slog.Logger {
 			if !Quiet {
 				fmt.Fprintf(os.Stderr, "log → %s (rotate at %d MB)\n", path, o.LogMaxMB)
 			}
-			if o.PanelMode || Quiet {
-				// LivePanel 占 stderr 时日志只落文件;Quiet 模式同理(stderr 静默)
-				out = rf
-			} else {
-				out = io.MultiWriter(os.Stderr, rf)
-			}
+			fileH = slog.NewTextHandler(rf, &slog.HandlerOptions{Level: level})
 		}
 	}
-	inner := slog.NewTextHandler(out, &slog.HandlerOptions{Level: level})
-	var h slog.Handler = inner
+
+	// Stderr sink — silenced by PanelMode or Quiet
+	if !o.PanelMode && !Quiet {
+		stderrH = clui.NewColorHandler(os.Stderr, level)
+	}
+
+	// Compose
+	var h slog.Handler
+	switch {
+	case fileH != nil && stderrH != nil:
+		h = clui.NewMultiHandler(stderrH, fileH)
+	case fileH != nil:
+		h = fileH
+	case stderrH != nil:
+		h = stderrH
+	default:
+		// PanelMode + LogFile=="-" → no sink; fall back to plain stderr text
+		h = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	}
+
 	if o.LogOnlyFailed {
-		bh := logsink.NewBufHandler(inner, true)
+		bh := logsink.NewBufHandler(h, true)
 		o.BufHandler = bh
 		h = bh
 	}

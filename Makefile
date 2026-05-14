@@ -1,9 +1,9 @@
 BINARY  := dsipper
 PKG     := dsipper
-VERSION ?= 0.10.0
+VERSION ?= 0.11.0
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-mac build-linux-amd64 build-linux-arm64 cross clean test fmt
+.PHONY: all build build-mac build-linux-amd64 build-linux-arm64 cross clean test test-race test-regression fmt
 
 all: build
 
@@ -26,6 +26,13 @@ cross: build-mac build-linux-amd64 build-linux-arm64
 
 test:
 	go test ./...
+
+test-race:
+	go test -race ./...
+
+# Full end-to-end black-box regression (13 cases). Re-builds first.
+test-regression: build
+	./test/regression.sh
 
 fmt:
 	go fmt ./...
