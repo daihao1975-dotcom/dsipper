@@ -672,7 +672,7 @@ func co(v int, path, subcmd string, maxMB int, onlyFailed bool, panelMode bool) 
 			fileH = slog.NewTextHandler(rf, &slog.HandlerOptions{Level: level})
 		}
 	}
-	if !panelMode && !Quiet {
+	if !panelMode {
 		stderrH = clui.NewColorHandler(os.Stderr, level)
 	}
 

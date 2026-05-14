@@ -6,6 +6,15 @@ All notable changes to **dsipper** are documented here. Versions follow
 
 ## [Unreleased]
 
+## [v0.11.1] — 2026-05-14
+
+### Fixed
+- `--quiet` was incorrectly disabling the colored stderr slog handler,
+  forcing logs back to plain `slog.NewTextHandler` output when paired
+  with `--log -`. `Quiet` now only silences the banner and the
+  `log → ...` notice (its actual intent); colored log lines are
+  preserved regardless of the flag.
+
 ## [v0.11.0] — 2026-05-14
 
 ### Added

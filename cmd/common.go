@@ -158,8 +158,10 @@ func buildLogger(o *CommonOpts, subcmd string) *slog.Logger {
 		}
 	}
 
-	// Stderr sink — silenced by PanelMode or Quiet
-	if !o.PanelMode && !Quiet {
+	// Stderr sink — silenced by PanelMode (LivePanel 占 stderr) only.
+	// Quiet 只静默 banner / "log → ..." notice,不影响业务 log 着色 —
+	// 用户给 --quiet --log - 时仍然期望看 colored log。
+	if !o.PanelMode {
 		stderrH = clui.NewColorHandler(os.Stderr, level)
 	}
 
