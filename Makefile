@@ -3,7 +3,7 @@ PKG     := dsipper
 VERSION ?= 0.11.1
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-mac build-linux-amd64 build-linux-arm64 cross clean test test-race test-regression fmt
+.PHONY: all build build-mac build-linux-amd64 build-linux-arm64 cross clean test test-race test-regression demo-html fmt
 
 all: build
 
@@ -33,6 +33,12 @@ test-race:
 # Full end-to-end black-box regression (13 cases). Re-builds first.
 test-regression: build
 	./test/regression.sh
+
+# Render a self-contained HTML page of the CLUI output (banner, colored
+# slog, LivePanel frames, summary box). Useful for reviewers without a
+# real terminal — outputs/clui-demo.html opens in the default browser.
+demo-html: build
+	./test/render-demo.sh
 
 fmt:
 	go fmt ./...
