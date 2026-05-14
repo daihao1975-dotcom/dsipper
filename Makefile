@@ -3,7 +3,7 @@ PKG     := dsipper
 VERSION ?= 0.11.1
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-mac build-linux-amd64 build-linux-arm64 cross clean test test-race test-regression demo-html fmt
+.PHONY: all build build-mac build-linux-amd64 build-linux-arm64 cross clean test test-race test-regression demo-html guide-html fmt
 
 all: build
 
@@ -39,6 +39,12 @@ test-regression: build
 # real terminal — outputs/clui-demo.html opens in the default browser.
 demo-html: build
 	./test/render-demo.sh
+
+# Generate outputs/dsipper-guide.html — full usage manual, dark theme,
+# embeds each subcommand's live `-h` output so the docs track the binary.
+guide-html: build
+	@python3 test/build-guide.py
+	@command -v open >/dev/null && open outputs/dsipper-guide.html || true
 
 fmt:
 	go fmt ./...
