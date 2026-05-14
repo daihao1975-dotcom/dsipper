@@ -6,6 +6,28 @@ All notable changes to **dsipper** are documented here. Versions follow
 
 ## [Unreleased]
 
+## [v0.11.3] — 2026-05-14
+
+### Fixed
+- **Stress mode dropped `--report` HTML on any failure.** `runStress`
+  called `os.Exit(1)` directly when at least one call failed,
+  bypassing the parent function's `defer saveReport()`. Result: the
+  HTML report was silently lost in exactly the runs where it mattered
+  most (mixed pass/fail, all-fail). All-OK stress runs still wrote it.
+  Now `runStress` returns a `bool` and the caller saves the report
+  before exiting non-zero. Locked in by regression Case 14.
+- **TLS keepalive fired a `malformed request line` WARN every interval.**
+  `tryExtractSIPFrame` correctly recognized the RFC 5626 double-CRLF
+  heartbeat and returned it as a 2-byte frame, but `readConn` forwarded
+  it to the SIP parser, which logged a noisy WARN every keepalive tick.
+  Now `readConn` swallows ≤4-byte CRLF-only frames before the inbox
+  dispatch. Locked in by regression Case 15.
+
+### Tests
+- Regression suite is now **15 cases** (was 13). New Case 14 verifies
+  the stress-mode report-on-failure fix; new Case 15 verifies the
+  keepalive WARN suppression. Full suite: 20 ✓ / 0 ✗.
+
 ## [v0.11.2] — 2026-05-14
 
 ### Added
