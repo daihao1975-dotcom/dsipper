@@ -17,13 +17,19 @@ G.711a/G.711u media (no SRTP).
 
 ## Features
 
-- **UDP / TLS signaling** + **plain RTP** G.711a/u (no SRTP, no DTLS by design)
-- **Four subcommands**: `options` (probe), `register` (Digest auth), `invite`
-  (place a real call), `listen` (UAS, answer calls)
+- **UDP / TLS / WS / WSS signaling** (RFC 7118 SIP-over-WebSocket) + RTP
+  G.711a/u media — **plain RTP** or **SRTP-SDES** (`AES_CM_128_HMAC_SHA1_80`,
+  RFC 4568); no DTLS-SRTP yet
+- **Five subcommands**: `options` (probe), `register` (Digest auth), `invite`
+  (place a real call), `listen` (UAS, answer calls), `scenario` (YAML script
+  runner)
 - **Built-in load test** — `invite --total N --concurrency M --cps R`
 - **DTMF dual mode** — RFC 4733 out-of-band on PT 101 *and* ITU-T Q.23 in-band
   dual tone spliced into the audio stream
-- **Re-INVITE / hold** — mid-call SDP direction switching (`sendonly` / `sendrecv`)
+- **Re-INVITE / hold** — mid-call SDP direction switching (`sendonly` / `sendrecv`);
+  `--update-on-hold` uses **UPDATE (RFC 3311)** instead of re-INVITE
+- **PRACK / 100rel (RFC 3262)** — UAC auto-PRACKs reliable provisionals;
+  UAS `--reliable-ringing` makes 180 carry `Require: 100rel`
 - **TLS keepalive** — RFC 5626 double-CRLF ping
 - **HTML signaling report** — failed calls get an inline SVG ladder diagram,
   status pie chart and wall-time histogram on top
@@ -31,8 +37,8 @@ G.711a/G.711u media (no SRTP).
   ETA — refreshed in place with ANSI cursor moves
 - **Failure-only logs** + **100MB rotation** — millions of successful calls
   leave zero disk growth
-- Static cross-compile to 4 platforms (darwin/arm64, darwin/amd64,
-  linux/amd64, linux/arm64), no cgo
+- Static cross-compile to 6 platforms (darwin/arm64, darwin/amd64,
+  linux/amd64, linux/arm64, linux/386, windows/amd64), no cgo
 
 ## Install
 

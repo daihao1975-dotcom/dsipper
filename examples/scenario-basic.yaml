@@ -1,0 +1,41 @@
+# Basic scenario:OPTIONS 探活 → REGISTER → 呼叫 → de-register。
+# 跑法:dsipper scenario examples/scenario-basic.yaml
+#
+# default 段给所有步骤铺底,各步骤可覆盖。expect 字段断言 status code,
+# 不匹配时 step 标 ✗;continue-on-fail 默认 false → 第一步失败即终止后续。
+
+name: "Probe + register + call"
+default:
+  server: 127.0.0.1:5060
+  transport: udp
+  timeout: 5s
+
+steps:
+  - action: options
+    label: probe
+    expect: 200
+
+  - action: register
+    label: register-on
+    user: 1000
+    pass: secret
+    domain: example.com
+    expires: 60
+    expect: 200
+
+  - action: sleep
+    duration: 500ms
+
+  - action: invite
+    label: call-1001
+    to: sip:1001@example.com
+    duration: 2s
+    expect: 200
+
+  - action: register
+    label: register-off
+    user: 1000
+    pass: secret
+    domain: example.com
+    expires: 0
+    expect: 200

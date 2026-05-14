@@ -27,10 +27,11 @@ const usage = `dsipper — SIP / RTP mock client for SBC debugging
   dsipper <command> [options]
 
 命令:
-  register     注册到 SBC (UDP 或 TLS,可带 Digest auth)
+  register     注册到 SBC (UDP / TLS / WS / WSS,可带 Digest auth)
   invite       发起真实呼叫,带 RTP 音频(默认 440Hz 正弦波,可 --wav 喂文件)
   options      发 OPTIONS 探活
   listen       UAS 监听模式,接听来电并回 880Hz 正弦波
+  scenario     按 YAML 脚本顺序跑多步流程(options / register / invite / sleep)
 
 例子:
   # 探活
@@ -70,6 +71,8 @@ func main() {
 		cmd.Options(os.Args[2:])
 	case "listen":
 		cmd.Listen(os.Args[2:])
+	case "scenario":
+		cmd.Scenario(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	case "--version", "version":

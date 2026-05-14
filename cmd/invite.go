@@ -57,6 +57,16 @@ func Invite(args []string) {
 	// Re-INVITE / hold(RFC 3261 §14):通话期发 re-INVITE 切 SDP direction
 	holdAfter := fs.Duration("hold-after", 0, "通话建立后 N 秒发 re-INVITE with a=sendonly(进 hold 态);0=不 hold")
 	holdDur := fs.Duration("hold-duration", 0, "hold 持续 M 秒后再发 re-INVITE with a=sendrecv(resume);0=进 hold 后不 resume")
+	updateOnHold := fs.Bool("update-on-hold", false, "用 UPDATE (RFC 3311) 代替 re-INVITE 做 hold/resume direction 切换(某些 IMS / Lync SBC 偏好 UPDATE)")
+
+	// PRACK / 100rel(RFC 3262)
+	enable100rel := fs.Bool("enable-100rel", true, "INVITE 通告 Supported: 100rel,且对端 1xx 带 Require:100rel + RSeq 时自动发 PRACK")
+	require100rel := fs.Bool("require-100rel", false, "INVITE 通告 Require: 100rel(强制对端用 reliable provisional;不支持的 SBC 会回 420 Bad Extension)")
+
+	// SRTP-SDES(RFC 4568):媒体面加密。默认 off;开启后 m= 用 RTP/SAVP profile +
+	// 单 a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:<base64>。对端 answer 必须含同套件 a=crypto,
+	// 否则视为协商失败 → call abort。
+	useSRTP := fs.Bool("srtp", false, "媒体面用 SRTP-SDES (AES_CM_128_HMAC_SHA1_80) 加密;对端 SDP answer 必须含 a=crypto")
 
 	pcapOpts := AttachPcap(fs)
 	if err := fs.Parse(args); err != nil {
@@ -132,7 +142,20 @@ func Invite(args []string) {
 		if *holdDur > 0 {
 			desc += fmt.Sprintf(", resume after %s", *holdDur)
 		}
+		if *updateOnHold {
+			desc += " (via UPDATE)"
+		}
 		banner = append(banner, clui.KV{K: "re-INVITE", V: clui.Green(desc)})
+	}
+	if *enable100rel || *require100rel {
+		mode := "supported"
+		if *require100rel {
+			mode = "required"
+		}
+		banner = append(banner, clui.KV{K: "100rel", V: clui.Green(mode)})
+	}
+	if *useSRTP {
+		banner = append(banner, clui.KV{K: "media", V: clui.Green("SRTP-SDES (AES_CM_128_HMAC_SHA1_80)")})
 	}
 	Banner("invite", banner)
 
@@ -233,6 +256,10 @@ func Invite(args []string) {
 		}
 		p.HoldAfter = *holdAfter
 		p.HoldDuration = *holdDur
+		p.UpdateOnHold = *updateOnHold
+		p.Enable100rel = *enable100rel
+		p.Require100rel = *require100rel
+		p.UseSRTP = *useSRTP
 		res := runInviteOnce(ctx, p)
 		if rep != nil && res.WallDur > 0 {
 			rep.AddWallDuration(res.WallDur)
@@ -281,6 +308,10 @@ func Invite(args []string) {
 	}
 	sp.HoldAfter = *holdAfter
 	sp.HoldDuration = *holdDur
+	sp.UpdateOnHold = *updateOnHold
+	sp.Enable100rel = *enable100rel
+	sp.Require100rel = *require100rel
+	sp.UseSRTP = *useSRTP
 	failed := runStress(log, co, rep, pcmShared, sp)
 	if failed {
 		// 显式 saveReport 后再 exit;defer 已注册但 os.Exit 不跑 defer。
@@ -317,6 +348,18 @@ type callParams struct {
 	// HoldDuration>0 时再 M 秒后发 re-INVITE a=sendrecv 恢复。
 	HoldAfter    time.Duration
 	HoldDuration time.Duration
+	// UpdateOnHold:用 UPDATE 代替 re-INVITE 做 direction 切换(RFC 3311)。
+	UpdateOnHold bool
+
+	// PRACK / 100rel(RFC 3262):
+	//   Enable100rel  → INVITE 加 Supported: 100rel,UAC.PRACKAuto = true
+	//   Require100rel → 在 Supported 之上加 Require: 100rel(逼对端用 reliable provisional)
+	Enable100rel  bool
+	Require100rel bool
+
+	// UseSRTP:开启 SRTP-SDES。Offer 用 RTP/SAVP profile + a=crypto;
+	// answer 必须含同套件 a=crypto,否则 abort 这通呼叫。
+	UseSRTP bool
 }
 
 type callResult struct {
@@ -355,6 +398,11 @@ func runInviteOnce(ctx context.Context, p callParams) callResult {
 	if p.Recorder != nil {
 		uac.Recorder = p.Recorder
 	}
+	// PRACKAuto 开关:Enable100rel 或 Require100rel 任一为 true 都开,SendRequest
+	// 内部收 1xx with Require:100rel + RSeq 时自动发 PRACK。
+	if p.Enable100rel || p.Require100rel {
+		uac.PRACKAuto = true
+	}
 	res.CallID = uac.CallID
 
 	fromURI := p.FromTemplate
@@ -378,6 +426,18 @@ func runInviteOnce(ctx context.Context, p callParams) callResult {
 	}
 	defer rtp.Close()
 
+	// SRTP-SDES:本地随机生成 master key + salt,base64 进 offer 的 a=crypto。
+	// answer 解出对端 inline 后,装上双向 context 才开始发媒体。
+	var localSRTPKey []byte
+	if p.UseSRTP {
+		k, kerr := media.GenerateSRTPKey()
+		if kerr != nil {
+			res.Err = fmt.Errorf("srtp key gen: %w", kerr)
+			return res
+		}
+		localSRTPKey = k
+	}
+
 	dst, err := uac.ResolveServer()
 	if err != nil {
 		res.Err = fmt.Errorf("resolve: %w", err)
@@ -389,8 +449,14 @@ func runInviteOnce(ctx context.Context, p callParams) callResult {
 	build := func(authHeader, authHeaderName string) *sipua.Message {
 		req := uac.BuildRequest("INVITE", p.To, fromURI, p.To)
 		req.Headers.Add("Contact", uac.LocalContact(sipua.ExtractSIPUser(fromURI)))
-		req.Headers.Add("Allow", "INVITE,ACK,CANCEL,BYE,OPTIONS,UPDATE")
+		req.Headers.Add("Allow", "INVITE,ACK,CANCEL,BYE,OPTIONS,UPDATE,PRACK")
 		req.Headers.Add("Content-Type", "application/sdp")
+		if p.Enable100rel || p.Require100rel {
+			req.Headers.Add("Supported", "100rel")
+		}
+		if p.Require100rel {
+			req.Headers.Add("Require", "100rel")
+		}
 		offer := sdp.Offer{
 			SessionID:  uint64(rand.Uint32()),
 			SessionVer: uint64(rand.Uint32()),
@@ -399,6 +465,9 @@ func runInviteOnce(ctx context.Context, p callParams) callResult {
 			ConnIP:     localIP,
 			AudioPort:  rtp.LocalPort(),
 			Codecs:     []sdp.Codec{codecObj, sdp.TelephoneEvent},
+		}
+		if p.UseSRTP && len(localSRTPKey) == media.SRTPKeyBytes {
+			offer.CryptoInline = media.EncodeSRTPInline(localSRTPKey)
 		}
 		req.Body = []byte(offer.Build())
 		if authHeader != "" {
@@ -462,6 +531,34 @@ func runInviteOnce(ctx context.Context, p callParams) callResult {
 		res.Err = fmt.Errorf("rtp remote: %w", err)
 		res.WallDur = time.Since(wallStart)
 		return res
+	}
+	// SRTP 协商:offer 带了 a=crypto,answer 必须也带且套件一致。
+	// 把对端 inline 解码作为 RX key,本地 key 作为 TX,装到 rtp session。
+	// 任何一步失败 → ACK + BYE 干净挂线,res.Err 记录失败原因。
+	abortSRTP := func(reason error) callResult {
+		res.Err = reason
+		res.WallDur = time.Since(wallStart)
+		ackInvite(uac, final, p.To, dst)
+		bye := uac.BuildRequest("BYE", p.To, fromURI, p.To)
+		bye.Headers.Set("To", final.Headers.Get("To"))
+		bye.Headers.Add("Contact", uac.LocalContact("dsipper"))
+		_, _ = uac.SendRequest(ctx, bye, dst, p.Timeout)
+		return res
+	}
+	if p.UseSRTP {
+		if answer.CryptoInline == "" {
+			return abortSRTP(fmt.Errorf("SRTP negotiation failed: peer answer has no a=crypto"))
+		}
+		peerKey, perr := media.DecodeSRTPInline(answer.CryptoInline)
+		if perr != nil {
+			return abortSRTP(fmt.Errorf("SRTP peer inline: %w", perr))
+		}
+		if err := rtp.SetSRTP(localSRTPKey, peerKey); err != nil {
+			return abortSRTP(fmt.Errorf("SRTP install: %w", err))
+		}
+		p.Log.Info("SRTP active", "call-id", uac.CallID,
+			"profile", answer.Profile,
+			"suite", media.SRTPProfileName)
 	}
 	p.Log.Info("CALL ESTABLISHED",
 		"call-id", uac.CallID,
@@ -573,14 +670,16 @@ func runInviteOnce(ctx context.Context, p callParams) callResult {
 		}()
 	}
 
-	// re-INVITE / hold goroutine:HoldAfter 后发 a=sendonly,HoldDuration 后发 a=sendrecv 恢复。
+	// doMidDialog 在通话期发 re-INVITE 或 UPDATE 切 SDP direction。
 	// 复用同一 RTP socket(m=audio port 不变),走 dispatcher 路由响应。
-	doReInvite := func(dir sdp.MediaDirection) {
-		req := uac.BuildRequest("INVITE", p.To, fromURI, p.To)
-		// in-dialog re-INVITE 必须带初始 200 OK 给的 to-tag
+	// method == "INVITE" 时 2xx 需要 ACK;method == "UPDATE" 时 2xx 不发 ACK
+	// (UPDATE 是事务自完结,RFC 3311 §5.2)。
+	doMidDialog := func(method string, dir sdp.MediaDirection) {
+		req := uac.BuildRequest(method, p.To, fromURI, p.To)
+		// in-dialog 请求必须带初始 200 OK 给的 to-tag
 		req.Headers.Set("To", final.Headers.Get("To"))
 		req.Headers.Add("Contact", uac.LocalContact(sipua.ExtractSIPUser(fromURI)))
-		req.Headers.Add("Allow", "INVITE,ACK,CANCEL,BYE,OPTIONS,UPDATE")
+		req.Headers.Add("Allow", "INVITE,ACK,CANCEL,BYE,OPTIONS,UPDATE,PRACK")
 		req.Headers.Add("Content-Type", "application/sdp")
 		offer := sdp.Offer{
 			SessionID:  uint64(rand.Uint32()),
@@ -610,10 +709,10 @@ func runInviteOnce(ctx context.Context, p callParams) callResult {
 		}
 		raw := req.Build()
 		if err := t.Send(raw, dst); err != nil {
-			p.Log.Warn("re-INVITE send", "err", err, "dir", string(dir))
+			p.Log.Warn(method+" send", "err", err, "dir", string(dir))
 			return
 		}
-		p.Log.Info("re-INVITE TX", "dir", string(dir), "call-id", uac.CallID)
+		p.Log.Info(method+" TX", "dir", string(dir), "call-id", uac.CallID)
 
 		deadline := time.After(p.Timeout)
 		for {
@@ -621,7 +720,7 @@ func runInviteOnce(ctx context.Context, p callParams) callResult {
 			case <-rtpCtx.Done():
 				return
 			case <-deadline:
-				p.Log.Warn("re-INVITE timeout", "dir", string(dir))
+				p.Log.Warn(method+" timeout", "dir", string(dir))
 				return
 			case m := <-reinviteResp:
 				if p.Recorder != nil {
@@ -631,30 +730,36 @@ func runInviteOnce(ctx context.Context, p callParams) callResult {
 					continue
 				}
 				if m.StatusCode == 200 {
-					ackInvite(uac, m, p.To, dst)
-					p.Log.Info("re-INVITE ACK", "dir", string(dir), "status", 200)
+					if method == "INVITE" {
+						ackInvite(uac, m, p.To, dst)
+					}
+					p.Log.Info(method+" ACK", "dir", string(dir), "status", 200)
 				} else {
-					p.Log.Warn("re-INVITE non-2xx", "status", m.StatusCode, "dir", string(dir))
+					p.Log.Warn(method+" non-2xx", "status", m.StatusCode, "dir", string(dir))
 				}
 				return
 			}
 		}
 	}
 	if p.HoldAfter > 0 {
+		holdMethod := "INVITE"
+		if p.UpdateOnHold {
+			holdMethod = "UPDATE"
+		}
 		go func() {
 			select {
 			case <-rtpCtx.Done():
 				return
 			case <-time.After(p.HoldAfter):
 			}
-			doReInvite(sdp.DirSendOnly)
+			doMidDialog(holdMethod, sdp.DirSendOnly)
 			if p.HoldDuration > 0 {
 				select {
 				case <-rtpCtx.Done():
 					return
 				case <-time.After(p.HoldDuration):
 				}
-				doReInvite(sdp.DirSendRecv)
+				doMidDialog(holdMethod, sdp.DirSendRecv)
 			}
 		}()
 	}
@@ -724,6 +829,11 @@ type stressParams struct {
 
 	HoldAfter    time.Duration
 	HoldDuration time.Duration
+	UpdateOnHold bool
+
+	Enable100rel  bool
+	Require100rel bool
+	UseSRTP       bool
 }
 
 // runStress 跑完 N 通呼叫,返回是否有失败(true=有 fail,调用方负责 exit code 1)。
@@ -852,6 +962,10 @@ func runStress(log *slog.Logger, co *CommonOpts, rep *report.Recorder, pcm []int
 				}
 				cp.HoldAfter = p.HoldAfter
 				cp.HoldDuration = p.HoldDuration
+				cp.UpdateOnHold = p.UpdateOnHold
+				cp.Enable100rel = p.Enable100rel
+				cp.Require100rel = p.Require100rel
+				cp.UseSRTP = p.UseSRTP
 				res := runInviteOnce(ctx, cp)
 				cancel()
 				done.Add(1)

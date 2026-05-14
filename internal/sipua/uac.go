@@ -35,6 +35,11 @@ type UAC struct {
 
 	// 可选信令事件回调,挂上后 logSIP / SendRaw 自动喂事件。
 	Recorder Recorder
+
+	// PRACKAuto:收到 1xx with Require:100rel + RSeq 时,SendRequest 自动构造并发出
+	// PRACK(RFC 3262 §7.1)。SendRequest 期间只把跟原请求同 CSeq method 的 ≥200
+	// 当作 final;PRACK 自身的 2xx 会被路过(不当 final)。
+	PRACKAuto bool
 }
 
 // NewUAC 简单构造。LocalIP 由调用方决定(可走 RouteIP 工具函数选)。
@@ -135,6 +140,10 @@ func (u *UAC) BuildRequest(method, ruri, fromURI, toURI string) *Message {
 
 // SendRequest 发送 + 等响应,直到拿到 final response (≥200) 或 timeout。
 // 返回所有响应序列(可能含一个或多个 1xx + 一个 final)。
+//
+// PRACKAuto=true 时,1xx 携带 Require:100rel + RSeq 会自动触发 PRACK
+// (RFC 3262 §7.1)。PRACK 是新事务,自身的 2xx 不会被当成本请求的 final,
+// SendRequest 通过 CSeq method 匹配过滤。
 func (u *UAC) SendRequest(ctx context.Context, req *Message, dst net.Addr, timeout time.Duration) ([]*Message, error) {
 	raw := req.Build()
 	u.logSIP("TX", req)
@@ -144,6 +153,7 @@ func (u *UAC) SendRequest(ctx context.Context, req *Message, dst net.Addr, timeo
 
 	deadline := time.Now().Add(timeout)
 	var resps []*Message
+	origMethod := req.Method
 
 	for time.Now().Before(deadline) {
 		remaining := time.Until(deadline)
@@ -186,12 +196,94 @@ func (u *UAC) SendRequest(ctx context.Context, req *Message, dst net.Addr, timeo
 			}
 			u.logSIP("RX", m)
 			resps = append(resps, m)
+			// 自动 PRACK:1xx with Require:100rel
+			if m.StatusCode >= 100 && m.StatusCode < 200 && u.PRACKAuto && needsPRACK(m) {
+				if err := u.sendPRACKFor(req, m, dst); err != nil {
+					u.Log.Warn("PRACK send", "err", err)
+				} else {
+					u.Log.Info("PRACK TX", "rseq", m.Headers.Get("RSeq"),
+						"call-id", m.Headers.Get("Call-ID"))
+				}
+				continue
+			}
 			if m.StatusCode >= 200 {
-				return resps, nil
+				// 只有跟原请求同 CSeq method 的 final 才算 final;PRACK/UPDATE 等带 dialog
+				// 的 2xx 不能挤掉真正的 final。CSeq 缺失或解析失败时按旧行为返回。
+				_, respMethod := m.CSeqNumMethod()
+				if respMethod == "" || respMethod == origMethod {
+					return resps, nil
+				}
 			}
 		}
 	}
 	return resps, fmt.Errorf("timeout")
+}
+
+// needsPRACK 判断 1xx 是否要求 reliable provisional(RFC 3262):
+// 同时具备 RSeq 头 与 Require: 100rel 时返回 true。
+func needsPRACK(resp *Message) bool {
+	if strings.TrimSpace(resp.Headers.Get("RSeq")) == "" {
+		return false
+	}
+	for _, v := range resp.Headers.GetAll("Require") {
+		for _, tok := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), "100rel") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sendPRACKFor 给定原请求 + 触发的 1xx,构造并发出 PRACK(新事务,新 CSeq,
+// dialog 三元组沿用 1xx 的 From/To/Call-ID,RAck = RSeq + 原请求 CSeq)。
+// 不等待响应,fire-and-forget;PRACK 的 2xx 由 SendRequest loop 自然消费。
+func (u *UAC) sendPRACKFor(origReq, resp *Message, dst net.Addr) error {
+	rseq := strings.TrimSpace(resp.Headers.Get("RSeq"))
+	parts := strings.Fields(strings.TrimSpace(origReq.Headers.Get("CSeq")))
+	if len(parts) < 2 {
+		return fmt.Errorf("bad orig CSeq: %q", origReq.Headers.Get("CSeq"))
+	}
+	rack := rseq + " " + parts[0] + " " + parts[1]
+
+	target := extractContactURIForPRACK(resp.Headers.Get("Contact"))
+	if target == "" {
+		target = origReq.RURI
+	}
+
+	u.CSeqNum++
+	via := fmt.Sprintf("SIP/2.0/%s %s;rport;branch=%s",
+		strings.ToUpper(u.T.Proto()), u.LocalViaHost(), Branch())
+	p := &Message{
+		IsRequest: true,
+		Method:    "PRACK",
+		RURI:      target,
+		Headers:   NewHeaders(),
+	}
+	p.Headers.Add("Via", via)
+	p.Headers.Add("Max-Forwards", "70")
+	p.Headers.Add("From", resp.Headers.Get("From"))
+	p.Headers.Add("To", resp.Headers.Get("To"))
+	p.Headers.Add("Call-ID", resp.Headers.Get("Call-ID"))
+	p.Headers.Add("CSeq", fmt.Sprintf("%d PRACK", u.CSeqNum))
+	p.Headers.Add("RAck", rack)
+	p.Headers.Add("User-Agent", u.UserAgent)
+	return u.SendRaw(p, dst)
+}
+
+// extractContactURIForPRACK 抠 Contact 头里的 SIP URI。
+// "<sip:x@y;p>" → "sip:x@y;p";裸 URI 直接返回。
+func extractContactURIForPRACK(c string) string {
+	c = strings.TrimSpace(c)
+	if c == "" {
+		return ""
+	}
+	if i := strings.Index(c, "<"); i >= 0 {
+		if j := strings.Index(c[i:], ">"); j > 0 {
+			return strings.TrimSpace(c[i+1 : i+j])
+		}
+	}
+	return c
 }
 
 // buildSimpleResponse 镜像请求的 Via/From/To/Call-ID/CSeq 拼一条无 body 响应,用于
@@ -224,11 +316,12 @@ func (u *UAC) ResolveServer() (net.Addr, error) {
 }
 
 // ResolveAddr 给定 transport 类型,把 "host:port" 解析成对应 net.Addr。
+// ws/wss 与 tls/tcp 都走 TCPAddr — WS transport 用 host:port 作为 conns map key。
 func ResolveAddr(proto, hostport string) (net.Addr, error) {
 	switch proto {
 	case "udp":
 		return net.ResolveUDPAddr("udp", hostport)
-	case "tls", "tcp":
+	case "tls", "tcp", "ws", "wss":
 		return net.ResolveTCPAddr("tcp", hostport)
 	}
 	return nil, fmt.Errorf("unknown proto: %s", proto)

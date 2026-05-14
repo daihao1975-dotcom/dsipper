@@ -447,6 +447,127 @@ if case_should_run $CASE; then
   cleanup_case $CASE
 fi
 
+# ── Case 16: PRACK (100rel) roundtrip ────────────────────────────────────────
+# UAC default-on advertises Supported:100rel; UAS --reliable-ringing sends 180
+# with Require:100rel + RSeq → UAC auto-sends PRACK → UAS replies 200 OK.
+CASE=16
+if case_should_run $CASE; then
+  hdr $CASE "PRACK / 100rel roundtrip"
+  $DSIPPER listen --bind 127.0.0.1:7016 --transport udp --reliable-ringing \
+    --log /tmp/_dsipper-c${CASE}-L.log --quiet >/dev/null 2>&1 &
+  LISTEN_PID=$!
+  sleep 0.5
+  $DSIPPER invite --server 127.0.0.1:7016 --transport udp \
+      --to sip:bob@127.0.0.1 --duration 500ms --save-recv off --quiet \
+      --log /tmp/_dsipper-c${CASE}-I.log >/dev/null 2>&1
+  stop_listen
+  prack_tx=$(grep -c "PRACK TX" /tmp/_dsipper-c${CASE}-I.log)
+  prack_rx=$(grep -c "PRACK RX → 200" /tmp/_dsipper-c${CASE}-L.log)
+  if [ "$prack_tx" = "1" ] && [ "$prack_rx" = "1" ]; then
+    pass "PRACK roundtrip OK (UAC sent 1, UAS replied 1)"
+  else
+    fail "expected prack_tx=1 prack_rx=1, got tx=$prack_tx rx=$prack_rx"
+  fi
+  cleanup_case $CASE
+fi
+
+# ── Case 17: UPDATE-on-hold (RFC 3311 instead of re-INVITE) ──────────────────
+CASE=17
+if case_should_run $CASE; then
+  hdr $CASE "UPDATE-on-hold direction mirroring"
+  start_listen 7017 ""
+  $DSIPPER invite --server 127.0.0.1:7017 --transport udp \
+      --to sip:bob@127.0.0.1 --duration 4s --save-recv off \
+      --hold-after 1s --hold-duration 1500ms --update-on-hold --quiet \
+      --log /tmp/_dsipper-c${CASE}-I.log >/dev/null 2>&1
+  stop_listen
+  hold=$(grep -c "UPDATE RX → 200 OK.*offer-dir=sendonly.*answer-dir=recvonly" /tmp/_dsipper-c${CASE}-L.log)
+  resume=$(grep -c "UPDATE RX → 200 OK.*offer-dir=sendrecv.*answer-dir=sendrecv" /tmp/_dsipper-c${CASE}-L.log)
+  # re-INVITE 不应该被用 — 全程用 UPDATE
+  reinvite=$(grep -c "re-INVITE RX" /tmp/_dsipper-c${CASE}-L.log)
+  if [ "$hold" -ge 1 ] && [ "$resume" -ge 1 ] && [ "$reinvite" = "0" ]; then
+    pass "UPDATE replaced re-INVITE (hold=$hold resume=$resume reinvite=$reinvite)"
+  else
+    fail "expected hold>=1 resume>=1 reinvite=0, got h=$hold r=$resume i=$reinvite"
+  fi
+  cleanup_case $CASE
+fi
+
+# ── Case 18: WebSocket (ws://) transport roundtrip ───────────────────────────
+CASE=18
+if case_should_run $CASE; then
+  hdr $CASE "WebSocket (ws) transport"
+  $DSIPPER listen --bind 127.0.0.1:7018 --transport ws \
+    --log /tmp/_dsipper-c${CASE}-L.log --quiet >/dev/null 2>&1 &
+  LISTEN_PID=$!
+  sleep 0.5
+  out=$($DSIPPER invite --server 127.0.0.1:7018 --transport ws \
+        --to sip:bob@127.0.0.1 --duration 500ms --save-recv off --quiet 2>&1)
+  stop_listen
+  if echo "$out" | grep -qE "OK: call .*rx=25 pkts"; then
+    pass "ws transport: 200 OK + RTP roundtrip"
+  else
+    fail "ws transport failed: $out"
+  fi
+  cleanup_case $CASE
+fi
+
+# ── Case 19: scenario YAML executor ──────────────────────────────────────────
+CASE=19
+if case_should_run $CASE; then
+  hdr $CASE "scenario YAML 3-step run"
+  start_listen 7019 ""
+  cat > /tmp/_dsipper-c${CASE}.yaml <<EOF
+name: regression-$CASE
+default:
+  server: 127.0.0.1:7019
+  transport: udp
+  timeout: 3s
+steps:
+  - action: options
+    label: probe
+    expect: 200
+  - action: sleep
+    duration: 50ms
+  - action: invite
+    label: shortcall
+    to: sip:bob@127.0.0.1
+    duration: 300ms
+    expect: 200
+EOF
+  out=$($DSIPPER scenario /tmp/_dsipper-c${CASE}.yaml --quiet --log - 2>&1)
+  rc=$?
+  stop_listen
+  if [ $rc -eq 0 ] && echo "$out" | grep -q "passed.*3 ✓"; then
+    pass "scenario all 3 steps passed (rc=$rc)"
+  else
+    fail "scenario rc=$rc, summary: $(echo "$out" | grep passed)"
+  fi
+  rm -f /tmp/_dsipper-c${CASE}.yaml
+  cleanup_case $CASE
+fi
+
+# ── Case 20: SRTP-SDES roundtrip with auth-tag overhead check ────────────────
+CASE=20
+if case_should_run $CASE; then
+  hdr $CASE "SRTP-SDES (AES_CM_128) media encryption"
+  start_listen 7020 ""
+  out=$($DSIPPER invite --server 127.0.0.1:7020 --transport udp \
+        --to sip:bob@127.0.0.1 --duration 1s --save-recv off --srtp --quiet 2>&1)
+  rc=$?
+  stop_listen
+  # 普通 RTP/G.711a 20ms ptime → 50 pkts/sec × 1s = 50 pkts × 172B = 8600B
+  # SRTP 加 10B auth tag/pkt → 50 × 182B = 9100B。tx 字节 > 9000 表示加密生效。
+  tx_b=$(echo "$out" | grep -oE 'tx=50 pkts/[0-9]+ B' | grep -oE '[0-9]+ B' | grep -oE '[0-9]+' | head -1)
+  rx_b=$(echo "$out" | grep -oE 'rx=50 pkts/[0-9]+ B' | grep -oE '[0-9]+ B' | grep -oE '[0-9]+' | head -1)
+  if [ $rc -eq 0 ] && [ "${tx_b:-0}" -ge 9000 ] && [ "${rx_b:-0}" -ge 9000 ]; then
+    pass "SRTP roundtrip OK (tx_bytes=$tx_b rx_bytes=$rx_b, auth-tag overhead present)"
+  else
+    fail "SRTP failed or no overhead: rc=$rc tx_b=$tx_b rx_b=$rx_b out=$out"
+  fi
+  cleanup_case $CASE
+fi
+
 # ── summary ──────────────────────────────────────────────────────────────────
 echo
 if [ ${#FAILED[@]} -eq 0 ]; then

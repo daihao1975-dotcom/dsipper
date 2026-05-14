@@ -61,6 +61,10 @@ type Offer struct {
 	AudioPort  int    // m=audio
 	Codecs     []Codec
 	Direction  MediaDirection // 空=sendrecv
+
+	// SRTP-SDES(RFC 4568):非空时 m= profile 改成 RTP/SAVP,并加 a=crypto:1 行。
+	// 值为 30 字节(16 master key + 14 master salt)的 base64 编码字符串。
+	CryptoInline string
 }
 
 // Build 渲染成 SDP 文本。
@@ -79,7 +83,15 @@ func (o Offer) Build() string {
 	for _, c := range o.Codecs {
 		pts = append(pts, strconv.Itoa(c.PT))
 	}
-	fmt.Fprintf(&b, "m=audio %d RTP/AVP %s\r\n", o.AudioPort, strings.Join(pts, " "))
+	profile := "RTP/AVP"
+	if o.CryptoInline != "" {
+		profile = "RTP/SAVP"
+	}
+	fmt.Fprintf(&b, "m=audio %d %s %s\r\n", o.AudioPort, profile, strings.Join(pts, " "))
+	if o.CryptoInline != "" {
+		// 单 tag,固定套件 AES_CM_128_HMAC_SHA1_80;不带 lifetime / MKI(RFC 4568 §6.1)
+		fmt.Fprintf(&b, "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:%s\r\n", o.CryptoInline)
+	}
 	for _, c := range o.Codecs {
 		fmt.Fprintf(&b, "a=rtpmap:%d %s/%d\r\n", c.PT, c.Name, c.Clock)
 		if c.Params != "" {
@@ -101,6 +113,10 @@ type Answer struct {
 	AudioPort int
 	Codec     Codec          // 对端真正选定的第一个 audio codec
 	Direction MediaDirection // 对端 SDP 声明的 direction,默认 sendrecv
+	Profile   string         // m= 第三字段:RTP/AVP / RTP/SAVP
+	// SRTP-SDES:对端 a=crypto inline 字段(base64),空表示未协商 SRTP。
+	// 仅识别 AES_CM_128_HMAC_SHA1_80 套件;其他套件忽略。
+	CryptoInline string
 }
 
 // Parse 解析对端 SDP,只抽我们关心的字段。
@@ -121,8 +137,18 @@ func Parse(body string) (Answer, error) {
 					return a, fmt.Errorf("invalid m=audio port: %w", err)
 				}
 				a.AudioPort = port
+				a.Profile = parts[2]
 				if pt, err := strconv.Atoi(parts[3]); err == nil {
 					firstPT = pt
+				}
+			}
+		case strings.HasPrefix(line, "a=crypto:"):
+			// 形态: a=crypto:<tag> <suite> inline:<keyparams> [opts]
+			rest := strings.TrimPrefix(line, "a=crypto:")
+			fields := strings.Fields(rest)
+			if len(fields) >= 3 && strings.EqualFold(fields[1], "AES_CM_128_HMAC_SHA1_80") {
+				if strings.HasPrefix(fields[2], "inline:") {
+					a.CryptoInline = strings.TrimPrefix(fields[2], "inline:")
 				}
 			}
 		case line == "a=sendrecv":
