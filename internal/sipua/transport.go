@@ -352,6 +352,11 @@ func (t *tlsTransport) readConn(c net.Conn) {
 				if !ok {
 					break
 				}
+				// RFC 5626 心跳:tryExtractSIPFrame 返回的 "\r\n" 单独 frame 不是 SIP message,
+				// 上层 parse 会报 "malformed request line"。直接吞掉,不投 inbox。
+				if len(msg) <= 4 && (bytes.Equal(msg, []byte("\r\n")) || bytes.Equal(msg, []byte("\r\n\r\n"))) {
+					continue
+				}
 				select {
 				case t.inbox <- Inbound{Data: msg, From: c.RemoteAddr(), Conn: c}:
 				default:

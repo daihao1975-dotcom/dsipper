@@ -388,6 +388,65 @@ PYEOF
   cleanup_case $CASE
 fi
 
+# ── Case 14: stress with all-fail still writes --report HTML ─────────────────
+# Regression for bug: runStress used to call os.Exit(1) directly, bypassing
+# the parent's defer saveReport(), so any fail caused the HTML report to be
+# silently dropped. Fix returns failed bool and lets caller saveReport+exit.
+CASE=14
+if case_should_run $CASE; then
+  hdr $CASE "stress all-fail writes HTML report"
+  rm -f /tmp/_dsipper-c${CASE}-r.html
+  # No listener on 7014 → all 4 calls timeout, exit 1
+  $DSIPPER invite --server 127.0.0.1:7014 --transport udp \
+      --to sip:bob@127.0.0.1 --duration 500ms --save-recv off --timeout 1s \
+      --total 4 --concurrency 2 --cps 0 --quiet \
+      --report /tmp/_dsipper-c${CASE}-r.html >/dev/null 2>&1
+  rc=$?
+  if [ $rc -ne 0 ] && [ -s /tmp/_dsipper-c${CASE}-r.html ]; then
+    pass "report written (size=$(wc -c < /tmp/_dsipper-c${CASE}-r.html)) and exit=$rc"
+  else
+    fail "report missing or empty (rc=$rc, file=$(ls -la /tmp/_dsipper-c${CASE}-r.html 2>&1))"
+  fi
+  cleanup_case $CASE
+fi
+
+# ── Case 15: TLS keepalive heartbeat doesn't trigger SIP parse WARN ──────────
+# Regression for bug: tryExtractSIPFrame returned the bare "\r\n" RFC 5626
+# heartbeat to the upper layer, which then logged "malformed request line"
+# every keepalive interval. Fix swallows tiny CRLF frames in readConn before
+# inbox dispatch.
+CASE=15
+if case_should_run $CASE; then
+  hdr $CASE "TLS keepalive heartbeat silent"
+  # Need self-signed cert for TLS listen
+  CERT=/tmp/_dsipper-c${CASE}-cert.pem
+  KEY=/tmp/_dsipper-c${CASE}-key.pem
+  openssl req -x509 -newkey rsa:2048 -keyout $KEY -out $CERT -days 1 -nodes \
+    -subj "/CN=localhost" >/dev/null 2>&1
+  $DSIPPER listen --bind 127.0.0.1:7015 --transport tls \
+    --cert $CERT --key $KEY --tls-keepalive 200ms \
+    --log /tmp/_dsipper-c${CASE}-L.log --quiet >/dev/null 2>/tmp/_dsipper-c${CASE}-L.err &
+  LISTEN_PID=$!
+  sleep 0.6
+  $DSIPPER invite --server 127.0.0.1:7015 --transport tls --insecure \
+    --to sip:bob@127.0.0.1 --duration 1500ms --save-recv off \
+    --tls-keepalive 200ms --quiet >/dev/null 2>&1
+  sleep 0.2
+  stop_listen
+  # grep -c 在 0 命中时退出码 1,套 `|| echo 0` 会和 grep 的 "0" 输出叠成两行,撞算术错误。
+  # 改用 wc -l 一致返回单数字,缺失文件 wc 也只是 stderr 警告。
+  warns_in_log=$(grep "malformed request line" /tmp/_dsipper-c${CASE}-L.log 2>/dev/null | wc -l | tr -d ' ')
+  warns_in_err=$(grep "malformed request line" /tmp/_dsipper-c${CASE}-L.err 2>/dev/null | wc -l | tr -d ' ')
+  total=$((warns_in_log + warns_in_err))
+  if [ "$total" = "0" ]; then
+    pass "0 'malformed request line' WARN over 7+ keepalive intervals"
+  else
+    fail "expected 0 keepalive parse WARN, got $total"
+  fi
+  rm -f $CERT $KEY /tmp/_dsipper-c${CASE}-L.err
+  cleanup_case $CASE
+fi
+
 # ── summary ──────────────────────────────────────────────────────────────────
 echo
 if [ ${#FAILED[@]} -eq 0 ]; then

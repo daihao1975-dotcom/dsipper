@@ -281,7 +281,12 @@ func Invite(args []string) {
 	}
 	sp.HoldAfter = *holdAfter
 	sp.HoldDuration = *holdDur
-	runStress(log, co, rep, pcmShared, sp)
+	failed := runStress(log, co, rep, pcmShared, sp)
+	if failed {
+		// 显式 saveReport 后再 exit;defer 已注册但 os.Exit 不跑 defer。
+		saveReport()
+		os.Exit(1)
+	}
 }
 
 // callParams 是 runInviteOnce 的入参 — 每通呼叫所需的全部上下文。
@@ -721,7 +726,9 @@ type stressParams struct {
 	HoldDuration time.Duration
 }
 
-func runStress(log *slog.Logger, co *CommonOpts, rep *report.Recorder, pcm []int16, p stressParams) {
+// runStress 跑完 N 通呼叫,返回是否有失败(true=有 fail,调用方负责 exit code 1)。
+// 不在 runStress 里直接 os.Exit,保留父函数 defer saveReport 的机会。
+func runStress(log *slog.Logger, co *CommonOpts, rep *report.Recorder, pcm []int16, p stressParams) bool {
 	var (
 		launched atomic.Int64
 		done     atomic.Int64
@@ -924,9 +931,7 @@ func runStress(log *slog.Logger, co *CommonOpts, rep *report.Recorder, pcm []int
 	}
 	fmt.Println(clui.BannerBox("stress summary", rows))
 
-	if fail > 0 {
-		os.Exit(1)
-	}
+	return fail > 0
 }
 
 // stressCPSStrPlain 给 panel/box dim 段拼接用,不带色。
