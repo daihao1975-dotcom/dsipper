@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pion/rtp"
+	"github.com/pion/srtp/v3"
 )
 
 // RTPSession 是单个 RTP 双向会话(同一对 UDP 端口,接收 + 发送 共用)。
@@ -43,6 +44,12 @@ type RTPSession struct {
 
 	// dtmfPT 是 RFC 4733 telephone-event payload type,默认 101。
 	dtmfPT uint8
+
+	// SRTP(SDES,RFC 4568)上下文:txCtx 仅用于加密发送,rxCtx 仅用于解密接收。
+	// 都为 nil 时走明文 RTP;任一非 nil 时该方向走 SRTP。
+	// pion 的 Context 不是并发安全的,所以 Send / Recv 调用前要拿 sendMu / rxLock。
+	srtpTx *srtp.Context
+	srtpRx *srtp.Context
 
 	// 已收到的 DTMF digits ASCII 串(去重 by event-start,RX 侧填),供 stats / report 引用。
 	rxDtmf   strings.Builder
@@ -131,6 +138,24 @@ func (s *RTPSession) SetRemote(ip string, port int) error {
 	return nil
 }
 
+// SetSRTP 给 session 装上 SRTP-SDES 加解密上下文。txKey / rxKey 都是 30 字节
+// (16 master key + 14 master salt,AES_CM_128_HMAC_SHA1_80)。调用后 Send/Recv
+// 自动走 SRTP 加解密;auth 失败的入站包默默丢掉。
+// 不可重入 — 应在 NewRTPSession 之后、Send/Recv goroutine 启动之前调一次。
+func (s *RTPSession) SetSRTP(txKey, rxKey []byte) error {
+	txCtx, err := NewSRTPContext(txKey)
+	if err != nil {
+		return fmt.Errorf("SRTP TX context: %w", err)
+	}
+	rxCtx, err := NewSRTPContext(rxKey)
+	if err != nil {
+		return fmt.Errorf("SRTP RX context: %w", err)
+	}
+	s.srtpTx = txCtx
+	s.srtpRx = rxCtx
+	return nil
+}
+
 // Send 把 PCM 切片按 ptime 节奏(20 ms = 160 samples @ 8 kHz)分包发出。
 // 阻塞直到全部发完或 ctx 取消。
 //
@@ -174,7 +199,18 @@ func (s *RTPSession) Send(ctx context.Context, pcm []int16) error {
 				s.sendMu.Unlock()
 				return err
 			}
-			if _, err := s.conn.WriteToUDP(buf, s.remote); err != nil {
+			wire := buf
+			if s.srtpTx != nil {
+				// SRTP 加密:输入是已 marshaled 的 RTP wire 字节;输出含 80-bit auth tag,
+				// 长度 = len(buf) + 10。EncryptRTP 内部用 header.SequenceNumber 推 ROC。
+				enc, eerr := s.srtpTx.EncryptRTP(nil, buf, nil)
+				if eerr != nil {
+					s.sendMu.Unlock()
+					return fmt.Errorf("srtp encrypt: %w", eerr)
+				}
+				wire = enc
+			}
+			if _, err := s.conn.WriteToUDP(wire, s.remote); err != nil {
 				s.sendMu.Unlock()
 				return err
 			}
@@ -182,7 +218,7 @@ func (s *RTPSession) Send(ctx context.Context, pcm []int16) error {
 			s.ts += samplesPerPkt
 			s.sendMu.Unlock()
 			atomic.AddUint64(&s.pktsTx, 1)
-			atomic.AddUint64(&s.bytesTx, uint64(len(buf)))
+			atomic.AddUint64(&s.bytesTx, uint64(len(wire)))
 		} else {
 			// 静音期间 timestamp 仍推进 — 跟 wall clock 对齐,DTMF 包用自己的 ts
 			s.sendMu.Lock()
@@ -227,10 +263,22 @@ func (s *RTPSession) Recv(ctx context.Context, log *slog.Logger) {
 			}
 			return
 		}
+		data := buf[:n]
+		if s.srtpRx != nil {
+			dec, derr := s.srtpRx.DecryptRTP(nil, data, nil)
+			if derr != nil {
+				// auth tag 失败 → 静默丢(防 replay / key 错配 / 第三方包混入)
+				if log != nil {
+					log.Debug("srtp decrypt failed", "err", derr, "len", n)
+				}
+				continue
+			}
+			data = dec
+		}
 		var pkt rtp.Packet
-		if err := pkt.Unmarshal(buf[:n]); err != nil {
+		if err := pkt.Unmarshal(data); err != nil {
 			if log != nil {
-				log.Debug("rtp unmarshal failed", "err", err, "len", n)
+				log.Debug("rtp unmarshal failed", "err", err, "len", len(data))
 			}
 			continue
 		}
@@ -370,6 +418,7 @@ func (s *RTPSession) SendDTMF(ctx context.Context, digits string, perDigitMs, ga
 
 // sendDTMFPacket 在 sendMu 锁内写一个 PT=dtmfPT 的 RTP 包,seq 自增,timestamp 不改。
 // marker=true 时设 M-bit(每 event 首包)。
+// 启用 SRTP 时与主语音流共用同一 srtpTx context — pion ROC 跟踪 seq 是连续的。
 func (s *RTPSession) sendDTMFPacket(payload []byte, eventTS uint32, marker bool) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
@@ -388,12 +437,20 @@ func (s *RTPSession) sendDTMFPacket(payload []byte, eventTS uint32, marker bool)
 	if err != nil {
 		return err
 	}
-	if _, err := s.conn.WriteToUDP(buf, s.remote); err != nil {
+	wire := buf
+	if s.srtpTx != nil {
+		enc, eerr := s.srtpTx.EncryptRTP(nil, buf, nil)
+		if eerr != nil {
+			return fmt.Errorf("srtp encrypt dtmf: %w", eerr)
+		}
+		wire = enc
+	}
+	if _, err := s.conn.WriteToUDP(wire, s.remote); err != nil {
 		return err
 	}
 	s.seq++
 	atomic.AddUint64(&s.pktsTx, 1)
-	atomic.AddUint64(&s.bytesTx, uint64(len(buf)))
+	atomic.AddUint64(&s.bytesTx, uint64(len(wire)))
 	return nil
 }
 

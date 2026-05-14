@@ -61,9 +61,10 @@ func durStrIfPos(d time.Duration) string {
 // CommonOpts 是各子命令共享的连接 + 日志参数。
 type CommonOpts struct {
 	Server      string // host:port
-	Transport   string // udp / tls
+	Transport   string // udp / tls / ws / wss
 	Insecure    bool
 	CAFile      string
+	WSPath      string // SIP-over-WebSocket(RFC 7118)路径,默认 "/"
 	Verbose     int    // 0=info, 1=debug
 	LogFile     string // 落盘日志路径,空=自动 ./dsipper-<cmd>-<YYYYMMDD-HHMMSS>.log,"-"=只 stderr
 	LogMaxMB    int    // 单文件 size 上限 MB,达上限滚动到 .old(默认 100,0=不滚)
@@ -86,9 +87,10 @@ type CommonOpts struct {
 func AttachCommon(fs *flag.FlagSet) *CommonOpts {
 	o := &CommonOpts{}
 	fs.StringVar(&o.Server, "server", "", "下游 SBC 地址 host:port (必填)")
-	fs.StringVar(&o.Transport, "transport", "udp", "传输层: udp 或 tls")
-	fs.BoolVar(&o.Insecure, "insecure", true, "TLS 不校验 server 证书 (默认 true,自签场景)")
-	fs.StringVar(&o.CAFile, "ca", "", "TLS 校验用 CA 证书 (开严格校验时填,会自动关 --insecure)")
+	fs.StringVar(&o.Transport, "transport", "udp", "传输层: udp / tls / ws / wss")
+	fs.BoolVar(&o.Insecure, "insecure", true, "TLS / WSS 不校验 server 证书 (默认 true,自签场景)")
+	fs.StringVar(&o.CAFile, "ca", "", "TLS / WSS 校验用 CA 证书 (开严格校验时填,会自动关 --insecure)")
+	fs.StringVar(&o.WSPath, "ws-path", "/", "SIP-over-WebSocket 路径(transport=ws/wss 生效;RFC 7118)")
 	fs.IntVar(&o.Verbose, "v", 0, "verbose 等级 0=info / 1=debug 含完整 SIP message")
 	fs.StringVar(&o.LogFile, "log", "", "日志落盘路径;空=cwd 下 dsipper-<cmd>-<时间戳>.log;'-'=只打 stderr")
 	fs.IntVar(&o.LogMaxMB, "log-max-mb", 100, "单日志文件 size 上限 MB,达上限 rename 到 .log.old 重开(0=不滚动)")
@@ -104,8 +106,10 @@ func (o *CommonOpts) MustValidate() {
 		fmt.Fprintln(os.Stderr, "ERR: --server 必填,例如 --server sbc.example.com:5060")
 		os.Exit(2)
 	}
-	if o.Transport != "udp" && o.Transport != "tls" {
-		fmt.Fprintln(os.Stderr, "ERR: --transport 只支持 udp / tls")
+	switch o.Transport {
+	case "udp", "tls", "ws", "wss":
+	default:
+		fmt.Fprintln(os.Stderr, "ERR: --transport 只支持 udp / tls / ws / wss")
 		os.Exit(2)
 	}
 	if o.CAFile != "" {
@@ -189,6 +193,7 @@ func buildLogger(o *CommonOpts, subcmd string) *slog.Logger {
 
 // MakeTransport 根据 opts 选择并构造 transport。
 // TLS 模式下立刻 dial 一次 server,让 LocalAddr 提前就位(否则 Via/Contact port=0)。
+// WS / WSS 也走 Dialer 提前建连(读 SIP 前需要完成 WebSocket Upgrade)。
 func (o *CommonOpts) MakeTransport() (sipua.Transport, error) {
 	switch o.Transport {
 	case "udp":
@@ -218,6 +223,36 @@ func (o *CommonOpts) MakeTransport() (sipua.Transport, error) {
 		if o.TLSKeepalive > 0 {
 			if ka, ok := t.(interface{ EnableKeepalive(time.Duration) }); ok {
 				ka.EnableKeepalive(o.TLSKeepalive)
+			}
+		}
+		return t, nil
+	case "ws", "wss":
+		useTLS := o.Transport == "wss"
+		host := o.Server
+		if i := strings.LastIndex(host, ":"); i > 0 {
+			host = host[:i]
+		}
+		path := o.WSPath
+		if path == "" {
+			path = "/"
+		}
+		t, err := sipua.NewWSClient(useTLS, sipua.WSOptions{
+			Path:       path,
+			ServerHost: o.Server,
+			TLS: sipua.TLSOptions{
+				ServerName: host,
+				Insecure:   o.Insecure,
+				CAFile:     o.CAFile,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		// WS Dial 用 host:port key,占位 net.Addr 即可(底层只用 String())
+		dst, _ := sipua.ResolveAddr("tcp", o.Server)
+		if d, ok := t.(sipua.Dialer); ok {
+			if err := d.Dial(dst); err != nil {
+				return nil, fmt.Errorf("%s connect: %w", o.Transport, err)
 			}
 		}
 		return t, nil

@@ -58,16 +58,18 @@ func (d *dialogTable) cancelAll() {
 // Listen 子命令:UAS 模式,监听端口接收 INVITE / OPTIONS,自动 200 接听并回 RTP。
 func Listen(args []string) {
 	fs := flag.NewFlagSet("listen", flag.ExitOnError)
-	transport := fs.String("transport", "udp", "udp / tls")
+	transport := fs.String("transport", "udp", "udp / tls / ws / wss")
 	bind := fs.String("bind", "127.0.0.1:5060", "监听 host:port(默认 loopback,避免无意暴露;真接外网用 0.0.0.0:5060)")
-	cert := fs.String("cert", "", "TLS server 证书 (transport=tls 必填)")
-	key := fs.String("key", "", "TLS 私钥 (transport=tls 必填)")
+	cert := fs.String("cert", "", "TLS/WSS server 证书 (transport=tls/wss 必填)")
+	key := fs.String("key", "", "TLS/WSS 私钥 (transport=tls/wss 必填)")
+	wsPath := fs.String("ws-path", "/", "SIP-over-WebSocket 路径(transport=ws/wss 生效;RFC 7118)")
 	codecName := fs.String("codec", "PCMA", "回送 codec PCMA / PCMU")
 	tone := fs.Float64("tone", 880, "回送正弦波频率 Hz (与主叫不同方便区分)")
 	saveRecv := fs.String("save-recv", "", "把每通呼叫收到的 RTP 落 WAV(前缀,如 'rx' → rx-N.wav;空 / 'off' = 不保存,默认)")
 	byeAfter := fs.Duration("bye-after", 0, "UAS 在答 200 OK 后 N 秒主动发 BYE (0=不主动 BYE,只回响应)")
 	noRTP := fs.Bool("no-rtp", false, "信令 only 模式:跳过 RTP socket / SDP answer / 媒体协程,只回纯 200 OK + 等 BYE(用于 cps 压测)")
 	enableUI := fs.Bool("ui", false, "stderr 显示实时统计面板(total / ok / fail / active / cps)")
+	reliableRinging := fs.Bool("reliable-ringing", false, "180 Ringing 带 Require:100rel + RSeq(RFC 3262),用于测 UAC 是否正确发 PRACK")
 	verbose := fs.Int("v", 0, "verbose 0/1")
 	logFile := fs.String("log", "", "日志落盘路径;空=cwd 下 dsipper-listen-<时间戳>.log;'-'=只打 stderr")
 	logMaxMB := fs.Int("log-max-mb", 100, "单日志文件 size 上限 MB,达上限 rename 到 .log.old 重开(0=不滚动)")
@@ -103,8 +105,20 @@ func Listen(args []string) {
 			os.Exit(2)
 		}
 		t, err = sipua.NewTLSServer(*bind, sipua.TLSOptions{CertFile: *cert, KeyFile: *key})
+	case "ws":
+		t, err = sipua.NewWSServer(false, sipua.WSOptions{ListenAddr: *bind, Path: *wsPath})
+	case "wss":
+		if *cert == "" || *key == "" {
+			fmt.Fprintln(os.Stderr, "ERR: WSS 模式需要 --cert / --key")
+			os.Exit(2)
+		}
+		t, err = sipua.NewWSServer(true, sipua.WSOptions{
+			ListenAddr: *bind,
+			Path:       *wsPath,
+			TLSServer:  sipua.TLSOptions{CertFile: *cert, KeyFile: *key},
+		})
 	default:
-		fmt.Fprintln(os.Stderr, "ERR: --transport udp/tls")
+		fmt.Fprintln(os.Stderr, "ERR: --transport udp/tls/ws/wss")
 		os.Exit(2)
 	}
 	if err != nil {
@@ -124,6 +138,7 @@ func Listen(args []string) {
 		{K: "tone", V: fmt.Sprintf("%.0f Hz", *tone)},
 		{K: "no-rtp", V: defaultStr(boolStr(*noRTP), clui.Dim("off"))},
 		{K: "bye-after", V: defaultStr(durStrIfPos(*byeAfter), clui.Dim("off"))},
+		{K: "100rel", V: defaultStr(boolStr(*reliableRinging), clui.Dim("off"))},
 		{K: "report", V: defaultStr(*reportPath, clui.Dim("off"))},
 		{K: "log-only-failed", V: defaultStr(boolStr(*logOnlyFailed), clui.Dim("off"))},
 	})
@@ -251,7 +266,7 @@ func Listen(args []string) {
 					wg.Add(1)
 					go func(idx int, inb sipua.Inbound, msg *sipua.Message) {
 						defer wg.Done()
-						handleIncomingCall(ctx, t, inb, msg, codecObj, *tone, *saveRecv, *byeAfter, idx, log, dt, rep)
+						handleIncomingCall(ctx, t, inb, msg, codecObj, *tone, *saveRecv, *byeAfter, *reliableRinging, idx, log, dt, rep)
 					}(callIdx, in, m)
 				}
 			case "ACK":
@@ -264,6 +279,17 @@ func Listen(args []string) {
 				replyStatus(t, in, m, 200, "OK", rep)
 				log.Info("CANCEL RX → 200")
 				dt.cancel(m.Headers.Get("Call-ID"))
+			case "PRACK":
+				// RFC 3262:对端 ACK 我们的 reliable provisional。这里只确认收到即可,
+				// 不真去校验 RAck → RSeq 对应关系(mock 场景下 SBC/UAC 行为正确就够)。
+				replyStatus(t, in, m, 200, "OK", rep)
+				log.Info("PRACK RX → 200",
+					"call-id", m.Headers.Get("Call-ID"),
+					"rack", m.Headers.Get("RAck"))
+			case "UPDATE":
+				// RFC 3311:UPDATE 可改 dialog 早期 SDP 或 mid-dialog 切 direction。
+				// 带 SDP body 时镜像 direction 回 200 OK,无 body 直接 200 OK。
+				handleUpdate(t, in, m, codecObj, log, rep)
 			default:
 				replyStatus(t, in, m, 405, "Method Not Allowed", rep)
 				log.Info("method not allowed", "method", m.Method)
@@ -312,6 +338,49 @@ func handleReInvite(t sipua.Transport, in sipua.Inbound, req *sipua.Message,
 		"answer-dir", string(answer.Direction))
 }
 
+// handleUpdate 处理 in-dialog UPDATE(RFC 3311):带 SDP body 镜像 direction 回 200 OK
+// + answer SDP;无 body 直接 200 OK。和 re-INVITE 的本地 RTP 行为一致(socket/port 不变),
+// 仅信令层应答。
+func handleUpdate(t sipua.Transport, in sipua.Inbound, req *sipua.Message,
+	codecObj sdp.Codec, log *slog.Logger, rep *report.Recorder) {
+	resp := buildResponse(req, 200, "OK")
+	if la := t.LocalAddr(); la != nil {
+		resp.Headers.Add("Contact", fmt.Sprintf("<sip:%s;transport=%s>", la.String(), strings.ToLower(t.Proto())))
+	}
+	if len(req.Body) == 0 {
+		// 无 body:纯刷新 Contact/timer 类,直接 200 OK
+		sendReply(t, in, resp, rep)
+		log.Info("UPDATE RX → 200 OK (no body)",
+			"call-id", req.Headers.Get("Call-ID"),
+			"cseq", req.Headers.Get("CSeq"))
+		return
+	}
+	offer, perr := sdp.Parse(string(req.Body))
+	if perr != nil {
+		log.Warn("UPDATE bad SDP", "err", perr)
+		replyStatus(t, in, req, 488, "Not Acceptable Here", rep)
+		return
+	}
+	resp.Headers.Add("Content-Type", "application/sdp")
+	answer := sdp.Offer{
+		SessionID:  uint64(rand.Uint32()),
+		SessionVer: uint64(rand.Uint32()),
+		Username:   "dsipper",
+		Origin:     offer.ConnIP,
+		ConnIP:     offer.ConnIP,
+		AudioPort:  offer.AudioPort,
+		Codecs:     []sdp.Codec{codecObj, sdp.TelephoneEvent},
+		Direction:  sdp.MirrorDirection(offer.Direction),
+	}
+	resp.Body = []byte(answer.Build())
+	sendReply(t, in, resp, rep)
+	log.Info("UPDATE RX → 200 OK",
+		"call-id", req.Headers.Get("Call-ID"),
+		"cseq", req.Headers.Get("CSeq"),
+		"offer-dir", string(offer.Direction),
+		"answer-dir", string(answer.Direction))
+}
+
 func handleIncomingCallSignalingOnly(t sipua.Transport, in sipua.Inbound, invite *sipua.Message,
 	log *slog.Logger, dt *dialogTable, rep *report.Recorder) {
 	resp := buildResponse(invite, 200, "OK")
@@ -327,12 +396,19 @@ func handleIncomingCallSignalingOnly(t sipua.Transport, in sipua.Inbound, invite
 }
 
 func handleIncomingCall(ctx context.Context, t sipua.Transport, in sipua.Inbound, invite *sipua.Message,
-	codecObj sdp.Codec, toneHz float64, saveRecvPrefix string, byeAfter time.Duration, idx int, log *slog.Logger, dt *dialogTable, rep *report.Recorder) {
+	codecObj sdp.Codec, toneHz float64, saveRecvPrefix string, byeAfter time.Duration, reliableRinging bool, idx int, log *slog.Logger, dt *dialogTable, rep *report.Recorder) {
 
 	// 100 Trying
 	replyStatus(t, in, invite, 100, "Trying", rep)
-	// 180 Ringing 一下,模拟真实
-	replyStatus(t, in, invite, 180, "Ringing", rep)
+	// 180 Ringing 一下,模拟真实;reliableRinging 时带 Require:100rel + RSeq(RFC 3262)
+	if reliableRinging {
+		ring := buildResponse(invite, 180, "Ringing")
+		ring.Headers.Add("Require", "100rel")
+		ring.Headers.Add("RSeq", "1")
+		sendReply(t, in, ring, rep)
+	} else {
+		replyStatus(t, in, invite, 180, "Ringing", rep)
+	}
 	time.Sleep(200 * time.Millisecond)
 
 	// 解 SDP offer
@@ -357,6 +433,33 @@ func handleIncomingCall(ctx context.Context, t sipua.Transport, in sipua.Inbound
 		return
 	}
 
+	// SRTP-SDES:对端用 RTP/SAVP + a=crypto 来时,UAS 也回 a=crypto(自己生成新 key)+
+	// 装上双向 context;只要 offer 套件命中 AES_CM_128_HMAC_SHA1_80(由 sdp.Parse 过滤),
+	// 我们就镜像协商。其他套件或无 a=crypto 时走明文。
+	var localSRTPKey []byte
+	if offer.CryptoInline != "" {
+		peerKey, perr := media.DecodeSRTPInline(offer.CryptoInline)
+		if perr != nil {
+			log.Warn("SRTP offer inline parse", "err", perr)
+			replyStatus(t, in, invite, 488, "Not Acceptable Here", rep)
+			return
+		}
+		k, kerr := media.GenerateSRTPKey()
+		if kerr != nil {
+			log.Warn("SRTP key gen", "err", kerr)
+			replyStatus(t, in, invite, 500, "Server Error", rep)
+			return
+		}
+		localSRTPKey = k
+		if err := rtp.SetSRTP(k, peerKey); err != nil {
+			log.Warn("SRTP install", "err", err)
+			replyStatus(t, in, invite, 488, "Not Acceptable Here", rep)
+			return
+		}
+		log.Info("SRTP active (UAS)", "call-id", invite.Headers.Get("Call-ID"),
+			"suite", media.SRTPProfileName)
+	}
+
 	// 拼 200 OK + answer SDP
 	answer := sdp.Offer{
 		SessionID:  uint64(rand.Uint32()),
@@ -366,6 +469,9 @@ func handleIncomingCall(ctx context.Context, t sipua.Transport, in sipua.Inbound
 		ConnIP:     localIP,
 		AudioPort:  rtp.LocalPort(),
 		Codecs:     []sdp.Codec{codecObj},
+	}
+	if localSRTPKey != nil {
+		answer.CryptoInline = media.EncodeSRTPInline(localSRTPKey)
 	}
 	uasContact := fmt.Sprintf("<sip:uas@%s;transport=%s>", localIP, t.Proto())
 	resp := buildResponse(invite, 200, "OK")

@@ -6,6 +6,52 @@ All notable changes to **dsipper** are documented here. Versions follow
 
 ## [Unreleased]
 
+### Added
+- **PRACK / 100rel (RFC 3262)** —
+  - UAC: `--enable-100rel` (default **on**) advertises `Supported: 100rel`
+    on every INVITE and auto-sends `PRACK` for any 1xx that carries
+    `Require: 100rel` + `RSeq`. The `RAck` header echoes
+    `<RSeq> <orig CSeq num> <orig method>`. `--require-100rel` adds
+    `Require: 100rel` so the SBC is *forced* to use reliable provisionals
+    (non-supporters reject with `420 Bad Extension`).
+  - UAS (`listen`): `--reliable-ringing` makes 180 Ringing carry
+    `Require: 100rel` + `RSeq: 1` so you can verify a UAC's PRACK
+    implementation. Inbound PRACK gets `200 OK`.
+  - `sipua.UAC.PRACKAuto` + `SendRequest` filters CSeq method so PRACK's
+    own 2xx doesn't get mistaken for the original transaction's final.
+- **UPDATE (RFC 3311)** — both directions:
+  - UAC: `--update-on-hold` makes hold/resume use UPDATE instead of
+    re-INVITE (some IMS / Lync SBCs prefer UPDATE for mid-dialog direction
+    changes; no ACK needed since UPDATE is transaction-self-contained).
+  - UAS (`listen`): inbound UPDATE with SDP body gets a 200 OK with
+    mirrored-direction answer SDP; empty-body UPDATE gets a bare 200 OK.
+- **SIP-over-WebSocket transport (RFC 7118)** — `--transport ws` and
+  `--transport wss`, supported by `invite`, `register`, `options`, and
+  `listen`. Sec-WebSocket-Protocol is `sip`. URL path defaults to `/`,
+  override with `--ws-path /sip`. WSS server takes the same `--cert /
+  --key` as TLS. Uses `nhooyr.io/websocket`.
+- **`scenario` subcommand** — runs a YAML script of steps (`options /
+  register / invite / sleep / log`) sequentially, each step asserts on a
+  status code via `expect:`. `default:` block fills server / transport /
+  timeout for every step; `continue-on-fail: true` keeps going past a
+  red. `--dry-run` prints the resolved steps without sending. See
+  `examples/scenario-basic.yaml`.
+- **SRTP-SDES media encryption (RFC 4568)** — `--srtp` on `invite`
+  switches the m= profile to `RTP/SAVP`, adds
+  `a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:<base64>` to the offer,
+  installs `pion/srtp/v3` AES-CM-128 + HMAC-SHA1-80 contexts on send/recv,
+  and aborts the call cleanly (ACK + BYE) if the answer is missing
+  `a=crypto`. `listen` auto-mirrors: if the offer has a SDES
+  `AES_CM_128_HMAC_SHA1_80` crypto line, the UAS generates its own key,
+  installs the SRTP contexts, and echoes its `a=crypto` in the 200 OK.
+  Outbound packets carry the 10-byte HMAC-SHA1-80 auth tag (visible in
+  the byte counts: 172 B → 182 B per G.711 packet).
+
+### Tests
+- Regression suite grows to **20 cases**: Case 16 (PRACK/100rel),
+  17 (UPDATE-on-hold replaces re-INVITE), 18 (ws transport), 19
+  (scenario YAML 3-step), 20 (SRTP roundtrip with auth-tag overhead).
+
 ## [v0.11.3] — 2026-05-14
 
 ### Fixed
