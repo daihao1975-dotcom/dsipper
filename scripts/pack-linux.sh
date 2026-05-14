@@ -33,14 +33,6 @@ make build build-linux-amd64 build-linux-386 >/dev/null
 VERSION=$(./bin/dsipper version 2>/dev/null | awk '{print $2}')
 [ -z "$VERSION" ] && { echo "could not read dsipper version"; exit 1; }
 
-# Regenerate the bilingual HTML usage guide so the tarball ships docs that
-# match this version's flags (the generator embeds each subcommand's
-# live `<cmd> -h` output, so doc + binary can never drift).
-# Run the python script directly to skip `make guide-html`'s auto-open
-# (the tarball use-case is non-interactive).
-echo "▶ regenerating HTML guide (en + zh-CN)"
-python3 test/build-guide.py >/dev/null
-
 mkdir -p dist
 : > dist/SHA256SUMS.linux
 
@@ -55,11 +47,6 @@ for arch in amd64 386; do
 
     install -m 0755 "$bin" "$pkgdir/dsipper"
     cp README.md README.zh-CN.md LICENSE CHANGELOG.md "$pkgdir/"
-
-    # Bilingual HTML guide — drop into docs/ so it doesn't crowd the top level
-    mkdir -p "$pkgdir/docs"
-    cp outputs/dsipper-guide.html       "$pkgdir/docs/" 2>/dev/null || true
-    cp outputs/dsipper-guide.zh-CN.html  "$pkgdir/docs/" 2>/dev/null || true
 
     cat > "$pkgdir/使用说明.txt" <<EOF
 dsipper $VERSION — Linux $arch 分发包
@@ -126,17 +113,11 @@ dsipper listen --bind 0.0.0.0:5060 --transport udp --ui
 --quiet          静默 banner + 启动提示
 
 
-5. 完整文档(本包内含)
-----------------------
-浏览器打开 docs/dsipper-guide.zh-CN.html 看完整中文使用指南
-(10 节:快速上手 / 4 个子命令 / HTML 报告 / 日志 / Cookbook /
-回归测试 / 故障排查;左侧 sidebar 可切英文版):
+5. 完整文档
+-----------
+中文使用指南(可在浏览器打开,左侧 sidebar 切换语言)、
+完整 flag 参考、Cookbook、故障排查 等见:
 
-    xdg-open docs/dsipper-guide.zh-CN.html       # Linux 桌面
-    # 或服务器拷回本机:
-    scp \$SERVER:dsipper-linux-*/docs/*.html .   # 然后双击
-
-在线参考:
     GitHub:        https://github.com/daihao1975-dotcom/dsipper
     Release page:  https://github.com/daihao1975-dotcom/dsipper/releases
     Changelog:     CHANGELOG.md (本目录)
