@@ -3,7 +3,7 @@ PKG     := dsipper
 VERSION ?= 0.11.2
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-mac build-linux-amd64 build-linux-arm64 build-linux-386 build-windows-amd64 cross clean test test-race test-regression demo-html guide-html fmt
+.PHONY: all build build-mac build-linux-amd64 build-linux-arm64 build-linux-386 build-windows-amd64 cross pack-linux clean test test-race test-regression demo-html guide-html fmt
 
 all: build
 
@@ -33,6 +33,13 @@ build-windows-amd64:
 cross: build-mac build-linux-amd64 build-linux-arm64 build-linux-386 build-windows-amd64
 	@echo "--- artifacts ---"
 	@ls -lh bin/
+
+# Linux x86 distribution tarballs (amd64 + 386) — each tarball ships the
+# renamed binary, README (en + zh), LICENSE, CHANGELOG, and a Chinese
+# 使用说明.txt one-pager. Output: dist/dsipper-linux-<arch>-v<ver>.tar.gz
+# + dist/SHA256SUMS.linux.
+pack-linux:
+	@./scripts/pack-linux.sh
 
 test:
 	go test ./...

@@ -25,3 +25,4 @@ claude-memory
 
 # old git history backup before open-sourcing
 .git-pre-opensource-backup-*
+dist/
