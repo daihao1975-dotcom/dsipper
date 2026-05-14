@@ -1,9 +1,9 @@
 BINARY  := dsipper
 PKG     := dsipper
-VERSION ?= 0.11.1
+VERSION ?= 0.11.2
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-mac build-linux-amd64 build-linux-arm64 cross clean test test-race test-regression demo-html guide-html fmt
+.PHONY: all build build-mac build-linux-amd64 build-linux-arm64 build-linux-386 build-windows-amd64 cross clean test test-race test-regression demo-html guide-html fmt
 
 all: build
 
@@ -20,7 +20,17 @@ build-linux-amd64:
 build-linux-arm64:
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-linux-arm64 .
 
-cross: build-mac build-linux-amd64 build-linux-arm64
+# 32-bit Linux x86 — old/embedded x86 boxes that don't run amd64
+build-linux-386:
+	GOOS=linux GOARCH=386 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-linux-386 .
+
+# Windows x86_64 — `.exe` suffix mandatory so File Explorer + cmd.exe
+# accept it without "execution policy" complaints. `dsipper-windows-amd64.exe`
+# == "Windows x86 (64-bit)" in lay terms.
+build-windows-amd64:
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY)-windows-amd64.exe .
+
+cross: build-mac build-linux-amd64 build-linux-arm64 build-linux-386 build-windows-amd64
 	@echo "--- artifacts ---"
 	@ls -lh bin/
 

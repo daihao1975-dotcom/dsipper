@@ -1,9 +1,15 @@
+//go:build !windows
+
 // pcap.go — 子命令启动时可选 spawn tcpdump,退出时 SIGTERM 收尾,生成 .pcap。
 //
 // 设计权衡见 README「自动抓包(pcap)」节。要点:
 //   - 不破坏 statically linked,纯 exec 外部 tcpdump
 //   - 需要宿主装 tcpdump 且具备 CAP_NET_RAW(root 或 setcap)
 //   - 默认 -U(packet-buffered)+ -s 0,大流量场景仍可能丢包,但调试足够
+//
+// 该文件 Unix-only:Windows 上 syscall.Setpgid / syscall.Kill 不存在,所以
+// 提供 pcap_windows.go stub 把 PcapOpts 接口骨架补齐(--pcap 等 flag 接受
+// 但忽略,启动时打 warn)。Windows 工程师抓包用 Wireshark / pktmon。
 package cmd
 
 import (

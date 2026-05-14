@@ -1,8 +1,11 @@
 name: release
 
-# Push a `vX.Y.Z` tag → static cross-build 4 platforms, generate SHA256SUMS,
+# Push a `vX.Y.Z` tag → static cross-build 6 platforms, generate SHA256SUMS,
 # attach all of them to an auto-created GitHub Release (body = the CHANGELOG
 # entry for that version, if present, otherwise the tag's annotation message).
+#
+# Platforms (all static, no cgo): darwin/arm64, darwin/amd64, linux/amd64,
+# linux/arm64, linux/386 (32-bit x86), windows/amd64.exe.
 
 on:
   push:
@@ -70,4 +73,6 @@ jobs:
             bin/dsipper-darwin-amd64 \
             bin/dsipper-linux-amd64 \
             bin/dsipper-linux-arm64 \
+            bin/dsipper-linux-386 \
+            bin/dsipper-windows-amd64.exe \
             bin/SHA256SUMS

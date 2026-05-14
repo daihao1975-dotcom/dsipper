@@ -6,6 +6,27 @@ All notable changes to **dsipper** are documented here. Versions follow
 
 ## [Unreleased]
 
+## [v0.11.2] — 2026-05-14
+
+### Added
+- **Windows x86_64 build** — `bin/dsipper-windows-amd64.exe`. Same feature
+  set as the Unix builds *minus* `--pcap` (which spawns `tcpdump` and uses
+  POSIX `Setpgid` / `Kill` — neither available on Windows). The flag stays
+  visible for CLI consistency but prints a warning + noops; capture
+  externally with Wireshark or `pktmon`.
+- **Linux 386 (32-bit x86)** build — `bin/dsipper-linux-386`. Same feature
+  set as `linux-amd64`. For embedded boxes and ancient SBC management
+  hosts still running 32-bit kernels.
+- `cmd/pcap_windows.go` stub — keeps the `PcapOpts` interface intact on
+  Windows so cmd/{invite,listen}.go don't need build-tag branches; the
+  Unix file gained `//go:build !windows`.
+- Release workflow now ships **6 binaries** (was 4) + SHA256SUMS.
+
+### Notes
+- "Windows x86" = `dsipper-windows-amd64.exe` (64-bit). 32-bit Windows
+  isn't built — practically all modern Windows installs are amd64.
+- `make cross` now produces 6 artifacts instead of 4.
+
 ## [v0.11.1] — 2026-05-14
 
 ### Fixed
