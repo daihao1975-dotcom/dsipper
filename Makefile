@@ -40,11 +40,12 @@ test-regression: build
 demo-html: build
 	./test/render-demo.sh
 
-# Generate outputs/dsipper-guide.html — full usage manual, dark theme,
-# embeds each subcommand's live `-h` output so the docs track the binary.
+# Generate the usage manual in English + 中文 (bilingual). Each page is
+# self-contained, embeds the live `<cmd> -h` output so docs track the binary,
+# and links to the other language via a chip in the sidebar.
 guide-html: build
 	@python3 test/build-guide.py
-	@command -v open >/dev/null && open outputs/dsipper-guide.html || true
+	@command -v open >/dev/null && open outputs/dsipper-guide.html outputs/dsipper-guide.zh-CN.html || true
 
 fmt:
 	go fmt ./...

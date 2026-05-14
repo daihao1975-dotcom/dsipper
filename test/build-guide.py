@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-build-guide.py — generate outputs/dsipper-guide.html, a single self-contained
-HTML usage manual.  Visual style matches outputs/clui-demo.html (dark, ANSI-
-colored code blocks) so the two pages read as a pair.
+build-guide.py — generate outputs/dsipper-guide.html (English) and
+outputs/dsipper-guide.zh-CN.html (Chinese). Each page is self-contained,
+embeds each subcommand's live ``-h`` output, and cross-links to the other
+language version via a chip in the TOC header.
 
-The page embeds dsipper's own `-h` output for each subcommand so the manual
-stays in lockstep with the binary — no risk of doc drift across versions.
+Usage:
+    python3 test/build-guide.py             # both langs
+    python3 test/build-guide.py --lang en   # English only
+    python3 test/build-guide.py --lang zh   # Chinese only
 """
 
 from __future__ import annotations
 
+import argparse
 import html
 import subprocess
 import sys
@@ -17,12 +21,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DSIPPER = ROOT / "bin" / "dsipper"
-OUT = ROOT / "outputs" / "dsipper-guide.html"
+OUT_DIR = ROOT / "outputs"
+
+LANGS = {
+    "en":    {"file": "dsipper-guide.html",       "label": "English", "code": "en"},
+    "zh-CN": {"file": "dsipper-guide.zh-CN.html", "label": "中文",     "code": "zh-CN"},
+}
 
 
 def run(args: list[str]) -> str:
     try:
-        # Pass DSIPPER_NO_COLOR so `-h` output is plain text (we wrap in <pre>)
         return subprocess.check_output(
             [str(DSIPPER), *args],
             stderr=subprocess.STDOUT,
@@ -41,11 +49,6 @@ def get_version() -> str:
         return "dev"
 
 
-# ── content ──────────────────────────────────────────────────────────────────
-# Each (anchor, title, body_html) tuple is one TOC entry.  Body is raw HTML
-# already; helpers below build it.
-
-
 def pre(text: str) -> str:
     return f'<pre class="cli">{html.escape(text.rstrip())}</pre>'
 
@@ -54,16 +57,12 @@ def shell(text: str) -> str:
     return f'<pre class="shell">{html.escape(text.rstrip())}</pre>'
 
 
-def section(anchor: str, title: str, body: str) -> tuple[str, str, str]:
-    return anchor, title, body
+# ── English sections ─────────────────────────────────────────────────────────
 
 
-def build_sections(version: str) -> list[tuple[str, str, str]]:
-    secs: list[tuple[str, str, str]] = []
-
-    # ── 1. quick start ────────────────────────────────────────────────────────
-    secs.append(
-        section(
+def sections_en() -> list[tuple[str, str, str]]:
+    return [
+        (
             "quick-start",
             "1. Quick start (loopback, no SBC)",
             f"""
@@ -78,12 +77,8 @@ one on the UAC side — they don't need a real SBC to verify the install.</p>
                      --save-recv recv.wav''')}
 <p>Or run <code>./examples/local-loopback.sh</code> which scripts both sides + cleanup.</p>
 """,
-        )
-    )
-
-    # ── 2. options ────────────────────────────────────────────────────────────
-    secs.append(
-        section(
+        ),
+        (
             "options",
             "2. options — health probe",
             f"""
@@ -92,12 +87,8 @@ one on the UAC side — they don't need a real SBC to verify the install.</p>
 dsipper options --server sbc.example.com:5061 --transport tls --insecure''')}
 {pre(run(["options", "-h"]))}
 """,
-        )
-    )
-
-    # ── 3. register ───────────────────────────────────────────────────────────
-    secs.append(
-        section(
+        ),
+        (
             "register",
             "3. register — REGISTER with optional Digest auth",
             f"""
@@ -111,12 +102,8 @@ dsipper register --server SBC:5060 --transport udp \\
                  --user 1000 --pass s3cret --domain example.com''')}
 {pre(run(["register", "-h"]))}
 """,
-        )
-    )
-
-    # ── 4. invite ─────────────────────────────────────────────────────────────
-    secs.append(
-        section(
+        ),
+        (
             "invite",
             "4. invite — place a real call (+ stress, DTMF, hold)",
             f"""
@@ -172,12 +159,8 @@ dsipper invite --server SBC:5060 --transport udp \\
 <h3>Full flag reference</h3>
 {pre(run(["invite", "-h"]))}
 """,
-        )
-    )
-
-    # ── 5. listen ─────────────────────────────────────────────────────────────
-    secs.append(
-        section(
+        ),
+        (
             "listen",
             "5. listen — UAS mode (answer calls)",
             f"""
@@ -205,12 +188,8 @@ Ctrl-C dumps anything in flight. listen also handles in-dialog <strong>re-INVITE
 mirroring the offered SDP direction (<code>sendonly → recvonly</code>, etc.).</p>
 {pre(run(["listen", "-h"]))}
 """,
-        )
-    )
-
-    # ── 6. HTML report ────────────────────────────────────────────────────────
-    secs.append(
-        section(
+        ),
+        (
             "html-report",
             "6. HTML signaling report",
             """
@@ -230,12 +209,8 @@ or <code>listen</code>; on exit dsipper writes a self-contained HTML page with:<
 stays O(failed calls + tracked samples). Successful calls drop their events on
 the 2xx final, only their final-status count survives.</p>
 """,
-        )
-    )
-
-    # ── 7. logs & quiet ───────────────────────────────────────────────────────
-    secs.append(
-        section(
+        ),
+        (
             "logs-quiet",
             "7. Logs, --quiet, panel mode",
             """
@@ -262,12 +237,8 @@ themselves; if you want stderr quiet too, pair it with <code>--log somefile.log<
 <code>listen --ui</code>) the panel owns stderr — the logger automatically routes
 to the file only so log lines never clobber the panel redraw.</p>
 """,
-        )
-    )
-
-    # ── 8. cookbook ───────────────────────────────────────────────────────────
-    secs.append(
-        section(
+        ),
+        (
             "cookbook",
             "8. Cookbook",
             f"""
@@ -309,12 +280,8 @@ env vars set — it runs the three steps and stops at the first failure.</p>
                --to sip:ivr@example.com --duration 20s \\
                --dtmf "1234#" --dtmf-mode both --dtmf-delay 2s''')}
 """,
-        )
-    )
-
-    # ── 9. regression matrix ──────────────────────────────────────────────────
-    secs.append(
-        section(
+        ),
+        (
             "regression",
             "9. Regression matrix",
             f"""
@@ -334,12 +301,8 @@ KEEP_LOGS=1 ./test/regression.sh''')}
 <p>Use this after every change touching CLI flags, the recorder, the transport
 layer, or the SIP state machine.</p>
 """,
-        )
-    )
-
-    # ── 10. troubleshooting ───────────────────────────────────────────────────
-    secs.append(
-        section(
+        ),
+        (
             "troubleshoot",
             "10. Troubleshooting",
             """
@@ -363,18 +326,302 @@ layer, or the SIP state machine.</p>
   </tbody>
 </table>
 """,
-        )
-    )
-
-    return secs
+        ),
+    ]
 
 
-# ── HTML template ────────────────────────────────────────────────────────────
+# ── 中文 sections ────────────────────────────────────────────────────────────
+
+
+def sections_zh() -> list[tuple[str, str, str]]:
+    return [
+        (
+            "quick-start",
+            "1. 5 分钟上手(loopback,不需要真 SBC)",
+            f"""
+<p>dsipper 是单个静态 binary。开两个 terminal,一边 UAS,一边 UAC,本机回环就能验证安装。</p>
+{shell('''# Terminal A —— listen 监听 loopback(默认就是 127.0.0.1:5060)
+./bin/dsipper listen --bind 127.0.0.1:5070 --transport udp
+
+# Terminal B —— 发起 5 秒呼叫,把收到的音频存下来
+./bin/dsipper invite --server 127.0.0.1:5070 --transport udp \\
+                     --to sip:bob@127.0.0.1 --duration 5s \\
+                     --save-recv recv.wav''')}
+<p>或者直接跑 <code>./examples/local-loopback.sh</code>,脚本帮你拉起两侧 + 收尾。</p>
+""",
+        ),
+        (
+            "options",
+            "2. options —— 探活",
+            f"""
+<p>发一条 SIP OPTIONS,期望 <code>200 OK</code>。成功 exit 0,可直接 drop 进 CI / cron。</p>
+{shell('''dsipper options --server sbc.example.com:5060 --transport udp
+dsipper options --server sbc.example.com:5061 --transport tls --insecure''')}
+{pre(run(["options", "-h"]))}
+""",
+        ),
+        (
+            "register",
+            "3. register —— REGISTER 带可选 Digest auth",
+            f"""
+<p>发 REGISTER。带 <code>--user/--pass</code> 时,dsipper 自动处理 401 挑战并用正确的 <code>Authorization</code> 头重发。<code>qop=auth</code> 和裸 MD5 都支持。</p>
+{shell('''# 无认证
+dsipper register --server SBC:5060 --transport udp \\
+                 --user 1000 --domain example.com --expires 60
+
+# Digest auth —— 适配大部分运营商级 registrar
+dsipper register --server SBC:5060 --transport udp \\
+                 --user 1000 --pass s3cret --domain example.com''')}
+{pre(run(["register", "-h"]))}
+""",
+        ),
+        (
+            "invite",
+            "4. invite —— 主叫一通呼叫(+ 压测、DTMF、保持)",
+            f"""
+<p>主力子命令。UDP / TLS 发起 1 通或 N 通 INVITE,协商 SDP,跑 G.711a/u RTP 会话,
+可选驱动 DTMF(RFC 4733 / 带内)与 re-INVITE direction 切换。</p>
+
+<h3>单通呼叫</h3>
+{shell('''dsipper invite --server SBC:5060 --transport udp \\
+               --to sip:1001@example.com --duration 10s
+
+# TLS,自带 WAV,保存接收的音频
+dsipper invite --server sbc.example.com:5061 --transport tls \\
+               --to sip:1001@example.com \\
+               --wav /tmp/prompt.wav --duration 30s --codec PCMU \\
+               --save-recv /tmp/answer.wav''')}
+
+<h3>并发压测(stress mode)</h3>
+<p><code>--total N</code> &gt; 1 触发压测模式:<code>N</code> 通呼叫分给 <code>--concurrency M</code> 个
+worker,被 <code>--cps R</code> 限速。每 worker 独占自己的 transport + UAC + RTP socket,
+不在共享 inbox 上 race。</p>
+{shell('''dsipper invite --server SBC:5060 --transport udp \\
+               --to sip:1001@example.com --duration 3s --save-recv off \\
+               --total 300 --concurrency 12 --cps 8 \\
+               --report stress.html''')}
+<p>跑的时候 stderr 上有<strong>多行 LivePanel</strong> 每秒重绘(进度条、launched/inflight/workers、
+ok/fail、p50/p95 wall、status 分布、ETA)。结束时打 summary box,含同一组指标 + 错误 top-3 原因,
+HTML 报告落到你给的路径。</p>
+
+<h3>DTMF 双模式</h3>
+<p>两种传输方式,任选一个或都开:</p>
+<ul>
+  <li><strong>rfc4733</strong> —— 带外 PT 101,现代主流。严格 RFC 4733 时序(带 M-bit 的 start 包、
+  每 50 ms 一个 update 包、三个带 E=1 的 end 包),与语音共享 SSRC,事件期间语音静音。</li>
+  <li><strong>inband</strong> —— ITU-T Q.23 双音 PCM 注入主 G.711 流。老式 PBX / ATA 设备不解
+  RFC 4733 时只能走这条。</li>
+  <li><strong>both</strong> —— 两路同发,最大兼容。</li>
+</ul>
+{shell('''dsipper invite --server SBC:5060 --transport udp \\
+               --to sip:1001@example.com --duration 8s \\
+               --dtmf "1234#" --dtmf-mode both \\
+               --dtmf-delay 500ms --dtmf-duration 120ms --dtmf-gap 80ms''')}
+
+<h3>通话期 hold / resume(re-INVITE)</h3>
+{shell('''# 通话开始 2 秒后发 re-INVITE w/ a=sendonly(进 hold),
+# 再 3 秒后发 a=sendrecv 恢复。同 dialog,m=audio 端口不变。
+dsipper invite --server SBC:5060 --transport udp \\
+               --to sip:1001@example.com --duration 10s \\
+               --hold-after 2s --hold-duration 3s''')}
+
+<h3>完整参数</h3>
+{pre(run(["invite", "-h"]))}
+""",
+        ),
+        (
+            "listen",
+            "5. listen —— UAS 模式(接听)",
+            f"""
+<p>loopback 测试的对端,或者调试 SBC outbound 一侧时的临时 UAS。默认 bind
+<strong>127.0.0.1:5060</strong> —— 想暴露公网必须显式 opt-in 改 0.0.0.0。</p>
+{shell('''# UDP,把每通呼叫收到的 RTP 存成 rx-1.wav / rx-2.wav / ...
+dsipper listen --bind 0.0.0.0:5060 --transport udp \\
+               --tone 880 --save-recv rx
+
+# TLS server,需要 cert + key
+dsipper listen --bind 0.0.0.0:5061 --transport tls \\
+               --cert ./certs/server.crt --key ./certs/server.key \\
+               --save-recv rx
+
+# UAS 接通 60 秒后主动发 BYE(模拟"被叫挂机"场景)
+dsipper listen --bind 0.0.0.0:5060 --transport udp --bye-after 60s
+
+# 实时面板(多行 LivePanel,1 Hz 刷新)
+dsipper listen --bind 0.0.0.0:5060 --transport udp --ui''')}
+<p>每通来电:<code>100 Trying → 180 Ringing → 200 OK</code> + SDP answer,回送 880 Hz 正弦波,
+主叫的 RTP 落 <code>rx-N.wav</code>。收到 BYE 立即关 RTP + 落盘;Ctrl-C 退出时把活跃通也落盘。
+listen 同样支持 in-dialog <strong>re-INVITE</strong>,会把对端的 SDP direction 镜像回 200 OK
+(<code>sendonly → recvonly</code> 等)。</p>
+{pre(run(["listen", "-h"]))}
+""",
+        ),
+        (
+            "html-report",
+            "6. HTML 信令报告",
+            """
+<p>给 <code>invite</code> 或 <code>listen</code> 传 <code>--report path/file.html</code>(或一个目录),
+退出时 dsipper 写一份自包含 HTML,内含:</p>
+<ul>
+  <li><strong>状态码饼图</strong>(整个 run 的全量,2xx 绿色渐变 / ≥300 红色渐变 /
+  pending 灰)。</li>
+  <li><strong>wall 时间直方图</strong>:min ~ p99 之间 20 个 linear bin(去掉长尾),
+  叠加 p50 / p95 标记线。</li>
+  <li><strong>状态码表</strong>(完整分布)。</li>
+  <li>失败 / pending 通的<strong>每通 SVG 时序图(ladder diagram)</strong>。成功通只进汇总,
+  失败详情上限是 <code>--report-max-failed N</code>(默认 50)。</li>
+</ul>
+<p>压测时 recorder 的 wall 样本上限是 100k,内存占用 O(失败通 + 已 track 样本)。成功通在拿到
+2xx final 时 drop events,只留 final 状态计数。</p>
+""",
+        ),
+        (
+            "logs-quiet",
+            "7. 日志,--quiet,panel 模式",
+            """
+<p>每个子命令都有三个日志 flag:</p>
+<ul>
+  <li><code>--log &lt;path&gt;</code> —— 文件 sink。空(默认)自动落 cwd 下
+  <code>dsipper-&lt;cmd&gt;-&lt;时间戳&gt;.log</code>。<code>-</code> 表示只打 stderr。</li>
+  <li><code>--log-max-mb 100</code> —— 单文件 size 上限。满了 rename 到 <code>.log.old</code>
+  (覆盖旧 <code>.old</code>),磁盘占用上限 <code>2 × max</code>。</li>
+  <li><code>--log-only-failed</code> —— 含 call-id 的日志先 buffer,2xx final 时丢弃,
+  ≥300 或退出 pending 时才 flush。几千万通成功呼叫磁盘零增长。</li>
+</ul>
+<p>stderr 走<strong>彩色 handler</strong>(按 key 语义着色:<code>status</code> 2xx 绿 / ≥300 红,
+<code>call-id</code> 截短 + dim 等)。文件 sink 保持 plain <code>slog.NewTextHandler</code>,
+<code>grep</code> / <code>awk</code> / <code>jq</code> 友好。</p>
+<p><code>--quiet</code> 静默 logo、config box 和 <code>log → ...</code> 提示
+(CI 友好);<em>不</em>静默业务日志本身。要 stderr 全静默,搭配 <code>--log somefile.log</code>。</p>
+<p>LivePanel 激活时(<code>invite</code> 压测,或 <code>listen --ui</code>)panel 独占 stderr ——
+logger 自动只写文件,避免业务日志冲掉 panel 重绘。</p>
+""",
+        ),
+        (
+            "cookbook",
+            "8. Cookbook(真实场景)",
+            f"""
+<h3>验证新部署 SBC 是否在线</h3>
+{shell('''# 1. 探活
+dsipper options --server $SBC:5060 --transport udp
+# 期望:OK: 200 OK
+
+# 2. 注册
+dsipper register --server $SBC:5060 --transport udp \\
+                 --user test1000 --pass test --domain $SBC_DOMAIN
+# 期望:OK: 200 Registered (auth MD5)
+
+# 3. 主叫一通(SBC 路由到下游 UAS)
+dsipper invite --server $SBC:5060 --transport udp \\
+               --to sip:test1001@$SBC_DOMAIN --duration 10s
+# 期望:tx=500 rx=500 对称''')}
+<p>或者跑 <code>./examples/check-sbc.sh</code>,设好 <code>SERVER / USER / PASS / DOMAIN / TO</code>
+环境变量,脚本帮你顺序跑三步,撞错就停。</p>
+
+<h3>排查"信令通但没声音"</h3>
+{shell('''dsipper invite --server $SBC --transport udp --to sip:test@example.com \\
+               --duration 5s -v 1 2>&1 | tee call.log
+# 对比 INVITE 跟 200 OK 里的 m=audio port —— 如果 SBC 没改写,
+# 说明 rtpengine 根本没看到这通。''')}
+
+<h3>压测 + 出报告</h3>
+{shell('''dsipper invite --server $SBC:5060 --transport udp \\
+               --to sip:test@example.com --duration 5s --save-recv off \\
+               --total 500 --concurrency 30 --cps 10 \\
+               --report run-$(date +%H%M%S).html''')}
+
+<h3>TLS 长连接抗 NAT / SBC 空闲拆链</h3>
+{shell('''dsipper options --server sbc.example.com:5061 --transport tls \\
+                --tls-keepalive 30s''')}
+
+<h3>DTMF 驱动 IVR 菜单</h3>
+{shell('''dsipper invite --server $SBC:5060 --transport udp \\
+               --to sip:ivr@example.com --duration 20s \\
+               --dtmf "1234#" --dtmf-mode both --dtmf-delay 2s''')}
+""",
+        ),
+        (
+            "regression",
+            "9. 回归测试矩阵",
+            f"""
+<p><code>test/regression.sh</code> 全量跑 13 个端到端 black-box case
+(OPTIONS / REGISTER / INVITE 单通 / DTMF rfc4733|inband|both / re-INVITE hold /
+stress LivePanel / stress 联合 / 全失败 err top / listen --ui / HTML 报告 /
+parser 113 个畸形包 fuzz)。每个 case 断言 log 标记 + exit code,失败 case 列表在末尾。</p>
+{shell('''# 全 13 case(自动先 build)
+make test-regression
+
+# 指定 case
+./test/regression.sh 4 7 11
+
+# 保留临时 log / WAV 给事后查
+KEEP_LOGS=1 ./test/regression.sh''')}
+<p>任何改 CLI flag、recorder、transport、SIP state machine 的 commit 后,跑一遍验不回归。</p>
+""",
+        ),
+        (
+            "troubleshoot",
+            "10. 故障排查",
+            """
+<table class="trouble">
+  <thead><tr><th>症状</th><th>可能原因 / 修法</th></tr></thead>
+  <tbody>
+    <tr><td>listen 启动报 <code>connection refused</code></td>
+        <td>端口被占(默认 127.0.0.1:5060)。换 <code>--bind 0.0.0.0:&lt;port&gt;</code> 一个空端口。</td></tr>
+    <tr><td>invite 卡在 "TX INVITE" 然后超时</td>
+        <td>UDP 包被丢 —— 确认 SBC 接受你的源 IP,看中间防火墙规则。用 <code>-v 1</code> 看完整原始消息。</td></tr>
+    <tr><td>200 OK / ACK 都通,但 RTP rx=0</td>
+        <td>SBC 没转 media。对比 SDP answer 里的 <code>c=</code> / <code>m=audio</code> 跟 SBC media
+        配置(rtpengine?)。HTML 报告的时序图能一眼看清 SDP。</td></tr>
+    <tr><td>自签证书 TLS 握手失败</td>
+        <td>默认 <code>--insecure true</code> 应该过。还失败说明 SBC 要求 SNI / 指定 server name,
+        把它显式拼到 <code>--server &lt;host:port&gt;</code> 里(host 当 SNI 发)。</td></tr>
+    <tr><td>压测大量 <code>err top: INVITE: timeout waiting for response</code></td>
+        <td>要么 SBC 在丢你(限速 / 503 backoff)要么本机内核丢出站 UDP。降 <code>--cps</code> 再试。</td></tr>
+    <tr><td>文件 log 涨过 <code>--log-max-mb</code></td>
+        <td>上限是<strong>单文件</strong>。老文件 rename 到 <code>.log.old</code>,磁盘上限 <code>2 × max</code>。
+        没看到滚动 → 检查路径是否可写。</td></tr>
+    <tr><td>panel 跟日志在 stderr 上交错</td>
+        <td>你在 panel 模式下用了 <code>--log -</code>(stderr-only)。让 dsipper 自动落文件,或者显式给
+        <code>--log somefile.log</code>。</td></tr>
+  </tbody>
+</table>
+""",
+        ),
+    ]
+
+
+# ── HTML template (lang-agnostic; chrome text comes from i18n dict) ──────────
+
+
+I18N = {
+    "en": {
+        "title":   "dsipper — usage guide",
+        "tagline": "SIP / RTP mock client for SBC debugging. Single static "
+                   "binary, 4 subcommands (options · register · invite · "
+                   "listen), UDP & TLS, plain RTP G.711a/u.",
+        "links":   ("github", "releases", "changelog", "CLUI rendering preview"),
+        "footer":  ('generated by test/build-guide.py · dsipper {ver} · '
+                    'embeds live <code>-h</code> output so the manual tracks '
+                    'the binary'),
+    },
+    "zh-CN": {
+        "title":   "dsipper —— 使用指南",
+        "tagline": "SBC 调试用的 SIP / RTP 模拟客户端。单 binary,4 子命令"
+                   "(options · register · invite · listen),UDP & TLS,"
+                   "明文 RTP G.711a/u。",
+        "links":   ("GitHub", "Releases", "Changelog", "CLUI 渲染预览"),
+        "footer":  ('由 test/build-guide.py 生成 · dsipper {ver} · 内嵌实时 '
+                    '<code>-h</code> 输出,文档随 binary 同步更新'),
+    },
+}
+
+
 TEMPLATE = """<!doctype html>
-<html lang="en">
+<html lang="__LANG__">
 <head>
 <meta charset="utf-8">
-<title>dsipper — usage guide (__VERSION__)</title>
+<title>__TITLE__ (__VERSION__)</title>
 <style>
   :root {
     --bg: #1a1a1a;
@@ -423,8 +670,27 @@ TEMPLATE = """<!doctype html>
   nav.toc .ver {
     color: var(--fg-muted);
     font-size: 11px;
-    margin-bottom: 18px;
+    margin-bottom: 8px;
     font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  nav.toc .lang-switch {
+    margin-bottom: 18px;
+    font-size: 11px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  nav.toc .lang-switch a {
+    color: var(--accent);
+    text-decoration: none;
+    padding: 2px 6px;
+    border: 1px solid var(--hair);
+    border-radius: 3px;
+    margin-right: 6px;
+  }
+  nav.toc .lang-switch a.active {
+    background: var(--accent);
+    color: #0a0a0a;
+    border-color: var(--accent);
+    font-weight: 700;
   }
   nav.toc ol {
     list-style: none;
@@ -531,16 +797,7 @@ TEMPLATE = """<!doctype html>
     overflow-x: auto;
     margin: 8px 0 16px;
   }
-  pre.shell {
-    border-left: 3px solid var(--primary);
-  }
-  pre.shell::before {
-    content: "$";
-    color: var(--primary);
-    font-weight: 700;
-    margin-right: 8px;
-    display: none;  /* hidden — shell prompt is implicit in pre.shell color */
-  }
+  pre.shell { border-left: 3px solid var(--primary); }
   pre.cli {
     border-left: 3px solid var(--fg-muted);
     color: var(--fg-muted);
@@ -586,40 +843,29 @@ TEMPLATE = """<!doctype html>
 <nav class="toc">
   <div class="brand">dsipper</div>
   <div class="ver">__VERSION__</div>
+  <div class="lang-switch">__LANG_SWITCH__</div>
   <ol>
 __TOC__
   </ol>
 </nav>
 <main>
   <header class="banner">
-    <h1>dsipper — usage guide</h1>
-    <p class="tagline">SIP / RTP mock client for SBC debugging. Single static binary,
-       4 subcommands (options · register · invite · listen), UDP &amp; TLS,
-       plain RTP G.711a/u.</p>
-    <div class="links">
-      <a href="https://github.com/daihao1975-dotcom/dsipper">github</a>
-      <a href="https://github.com/daihao1975-dotcom/dsipper/releases">releases</a>
-      <a href="https://github.com/daihao1975-dotcom/dsipper/blob/main/CHANGELOG.md">changelog</a>
-      <a href="clui-demo.html">CLUI rendering preview</a>
-    </div>
+    <h1>__TITLE__</h1>
+    <p class="tagline">__TAGLINE__</p>
+    <div class="links">__LINKS__</div>
   </header>
 __BODY__
-  <footer class="site">
-    generated by test/build-guide.py · dsipper __VERSION__ · embeds live
-    <code>-h</code> output so the manual tracks the binary
-  </footer>
+  <footer class="site">__FOOTER__</footer>
 </main>
 </body>
 </html>
 """
 
 
-def main() -> None:
-    if not DSIPPER.exists():
-        sys.stderr.write(f"binary not found: {DSIPPER} (run `make build` first)\n")
-        sys.exit(1)
-    version = get_version()
-    secs = build_sections(version)
+def render(lang: str, version: str) -> str:
+    secs = sections_zh() if lang == "zh-CN" else sections_en()
+    i18n = I18N[lang]
+    lang_code = LANGS[lang]["code"]
 
     toc = "\n".join(
         f'    <li><a href="#{a}">{html.escape(t.split(". ", 1)[-1])}</a></li>'
@@ -630,16 +876,66 @@ def main() -> None:
         for a, t, b in secs
     )
 
-    page = (
-        TEMPLATE
-        .replace("__VERSION__", html.escape(version))
-        .replace("__TOC__", toc)
-        .replace("__BODY__", body)
+    # Language switcher chips
+    chips = []
+    for code, meta in LANGS.items():
+        cls = "active" if code == lang else ""
+        href = meta["file"]
+        label = html.escape(meta["label"])
+        chips.append(f'<a class="{cls}" href="{href}">{label}</a>')
+    lang_switch = "".join(chips)
+
+    # Top right links
+    gh = "https://github.com/daihao1975-dotcom/dsipper"
+    link_labels = i18n["links"]
+    links_html = (
+        f'<a href="{gh}">{html.escape(link_labels[0])}</a>'
+        f'<a href="{gh}/releases">{html.escape(link_labels[1])}</a>'
+        f'<a href="{gh}/blob/main/CHANGELOG.md">{html.escape(link_labels[2])}</a>'
+        f'<a href="clui-demo.html">{html.escape(link_labels[3])}</a>'
     )
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(page, encoding="utf-8")
-    sys.stderr.write(f"✓ guide → {OUT}\n  size: {OUT.stat().st_size} bytes\n")
+    page = (
+        TEMPLATE
+        .replace("__LANG__", lang_code)
+        .replace("__VERSION__", html.escape(version))
+        .replace("__TITLE__", html.escape(i18n["title"]))
+        .replace("__TAGLINE__", html.escape(i18n["tagline"]))
+        .replace("__LANG_SWITCH__", lang_switch)
+        .replace("__LINKS__", links_html)
+        .replace("__TOC__", toc)
+        .replace("__BODY__", i18n["footer"].format(ver=html.escape(version)).join([
+            body + "\n  ", ""
+        ]) if False else body)  # body unchanged
+        .replace("__FOOTER__", i18n["footer"].format(ver=html.escape(version)))
+    )
+    return page
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lang", choices=["en", "zh", "zh-CN", "all"], default="all",
+                        help="Which language(s) to emit. Default: all")
+    args = parser.parse_args()
+
+    if not DSIPPER.exists():
+        sys.stderr.write(f"binary not found: {DSIPPER} (run `make build` first)\n")
+        sys.exit(1)
+
+    version = get_version()
+    targets = []
+    if args.lang in ("en", "all"):
+        targets.append("en")
+    if args.lang in ("zh", "zh-CN", "all"):
+        targets.append("zh-CN")
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    for lang in targets:
+        page = render(lang, version)
+        out = OUT_DIR / LANGS[lang]["file"]
+        out.write_text(page, encoding="utf-8")
+        sys.stderr.write(f"✓ {LANGS[lang]['label']:>8} guide → {out}\n"
+                         f"             size: {out.stat().st_size} bytes\n")
 
 
 if __name__ == "__main__":
