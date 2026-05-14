@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+// MaxSIPMessageBytes 是单条 SIP message 的硬上限(header + body)。
+// SIP 消息很少超过 8KB,64KB 已能覆盖含 PIDF / 多 SDP / 大量 Route 的极端场景。
+// 用于:① TLS/WS 流式拆帧时校验 Content-Length;② 防御恶意对端送超大帧 OOM。
+const MaxSIPMessageBytes = 64 * 1024
+
 // Transport 抽象 UDP / TLS-over-TCP 两种 SIP 承载。
 //
 // 给 UAC 用:Send + Recv 异步,Recv 把每条完整 SIP message 投到 channel。
@@ -102,6 +107,8 @@ func (t *udpTransport) Close() error {
 
 func (t *udpTransport) readLoop() {
 	buf := make([]byte, 65535)
+	var dropped uint64
+	var lastWarn time.Time
 	for {
 		n, addr, err := t.conn.ReadFromUDP(buf)
 		if err != nil {
@@ -112,7 +119,13 @@ func (t *udpTransport) readLoop() {
 		select {
 		case t.inbox <- Inbound{Data: data, From: addr}:
 		default:
-			// 满了就丢,避免阻塞读循环
+			// inbox 满:吞掉避免阻塞读循环,但 1s 一次 stderr warn 暴露问题
+			// (避免大量 drop 时把 stderr 刷爆)。
+			dropped++
+			if now := time.Now(); now.Sub(lastWarn) >= time.Second {
+				fmt.Fprintf(os.Stderr, "WARN: udp inbox full, dropped %d packets (last from %s)\n", dropped, addr)
+				lastWarn = now
+			}
 		}
 	}
 }
@@ -388,9 +401,20 @@ func tryExtractSIPFrame(buf *bytes.Buffer) ([]byte, bool) {
 		}
 		return nil, false
 	}
-	// 解析 header 找 Content-Length
+	// header 段本身也要限长 — 防御 attacker 不送 \r\n\r\n 让 buf 持续涨
+	if idx > MaxSIPMessageBytes {
+		// 丢弃整段无效数据,把 cursor 移过当前 \r\n\r\n,避免锁死
+		buf.Next(idx + 4)
+		return nil, false
+	}
+	// 解析 header 找 Content-Length(scanContentLength 自身已 cap 到 MaxSIPMessageBytes)
 	headEnd := idx + 4
 	cl := scanContentLength(data[:idx])
+	if cl < 0 || cl > MaxSIPMessageBytes {
+		// 非法或超大 Content-Length:丢掉整个 frame(只消耗 header 部分),避免长期堵塞
+		buf.Next(headEnd)
+		return nil, false
+	}
 	total := headEnd + cl
 	if buf.Len() < total {
 		return nil, false
@@ -401,8 +425,9 @@ func tryExtractSIPFrame(buf *bytes.Buffer) ([]byte, bool) {
 	return frame, true
 }
 
+// scanContentLength 返回 Content-Length 数值;非法/超出 MaxSIPMessageBytes 返 -1。
+// 防御:逐位累加配合上限提前结束,避免任何 int 溢出可能。
 func scanContentLength(headBytes []byte) int {
-	// 简单逐行扫,case-insensitive
 	for _, line := range strings.Split(string(headBytes), "\r\n") {
 		colon := strings.IndexByte(line, ':')
 		if colon < 0 {
@@ -412,11 +437,19 @@ func scanContentLength(headBytes []byte) int {
 		if name == "content-length" || name == "l" {
 			v := strings.TrimSpace(line[colon+1:])
 			n := 0
+			seenDigit := false
 			for _, ch := range v {
 				if ch < '0' || ch > '9' {
 					break
 				}
+				seenDigit = true
 				n = n*10 + int(ch-'0')
+				if n > MaxSIPMessageBytes {
+					return -1
+				}
+			}
+			if !seenDigit {
+				return -1
 			}
 			return n
 		}

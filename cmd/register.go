@@ -16,7 +16,8 @@ func Register(args []string) {
 	fs := flag.NewFlagSet("register", flag.ExitOnError)
 	co := AttachCommon(fs)
 	user := fs.String("user", "", "AOR 用户名 (必填)")
-	pass := fs.String("pass", "", "Digest 密码")
+	pass := fs.String("pass", "", "Digest 密码 (优先级: --pass > --pass-file > $DSIPPER_PASS;命令行 argv 可被 /proc 暴露,生产用后两者)")
+	passFile := fs.String("pass-file", "", "从文件读 Digest 密码(首行;建议 chmod 600)")
 	domain := fs.String("domain", "", "AOR 域 (默认 = server host)")
 	expires := fs.Int("expires", 60, "Expires 秒")
 	timeout := fs.Duration("timeout", 8*time.Second, "单事务超时")
@@ -29,6 +30,12 @@ func Register(args []string) {
 		fmt.Fprintln(os.Stderr, "ERR: --user 必填")
 		os.Exit(2)
 	}
+	resolvedPass, err := ResolvePassword(*pass, *passFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERR: %v\n", err)
+		os.Exit(2)
+	}
+	*pass = resolvedPass
 	log := co.MakeLogger("register")
 
 	Banner("register", []clui.KV{

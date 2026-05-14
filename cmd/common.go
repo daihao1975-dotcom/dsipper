@@ -42,6 +42,30 @@ func defaultStr(s, d string) string {
 	return s
 }
 
+// ResolvePassword 决定最终用作 Digest 密码的字符串。优先级:
+//  1. --pass <flag> 直接给(便利,但 argv 可见,有 /proc 暴露风险)
+//  2. --pass-file <path> 文件首行(0600 权限,生产推荐)
+//  3. $DSIPPER_PASS 环境变量(CI / 容器场景)
+// 三者都空则返回空串(调用方按需校验)。
+func ResolvePassword(flagPass, passFile string) (string, error) {
+	if flagPass != "" {
+		return flagPass, nil
+	}
+	if passFile != "" {
+		b, err := os.ReadFile(passFile)
+		if err != nil {
+			return "", fmt.Errorf("read --pass-file: %w", err)
+		}
+		// 取首行,去 \r\n 与尾部空白;不解析多行
+		s := string(b)
+		if i := strings.IndexAny(s, "\r\n"); i >= 0 {
+			s = s[:i]
+		}
+		return strings.TrimRight(s, " \t"), nil
+	}
+	return os.Getenv("DSIPPER_PASS"), nil
+}
+
 // boolStr true→"on" / false→""(空字符串配合 defaultStr 走 fallback)。
 func boolStr(b bool) string {
 	if b {
@@ -88,7 +112,8 @@ func AttachCommon(fs *flag.FlagSet) *CommonOpts {
 	o := &CommonOpts{}
 	fs.StringVar(&o.Server, "server", "", "下游 SBC 地址 host:port (必填)")
 	fs.StringVar(&o.Transport, "transport", "udp", "传输层: udp / tls / ws / wss")
-	fs.BoolVar(&o.Insecure, "insecure", true, "TLS / WSS 不校验 server 证书 (默认 true,自签场景)")
+	// 安全默认:Insecure=false。需要自签证书时显式 --insecure;启用时 MustValidate 会打 stderr 警告。
+	fs.BoolVar(&o.Insecure, "insecure", false, "TLS / WSS 不校验 server 证书 (默认 false;自签场景需显式开)")
 	fs.StringVar(&o.CAFile, "ca", "", "TLS / WSS 校验用 CA 证书 (开严格校验时填,会自动关 --insecure)")
 	fs.StringVar(&o.WSPath, "ws-path", "/", "SIP-over-WebSocket 路径(transport=ws/wss 生效;RFC 7118)")
 	fs.IntVar(&o.Verbose, "v", 0, "verbose 等级 0=info / 1=debug 含完整 SIP message")
@@ -101,6 +126,8 @@ func AttachCommon(fs *flag.FlagSet) *CommonOpts {
 }
 
 // MustValidate 检查必填参数,失败直接 exit 2。
+// 副作用:当 transport=tls/wss 且 Insecure=true 时打印醒目 stderr 警告 —
+// 默认值 false 让用户主动 opt-in 跳过证书校验,避免误用。
 func (o *CommonOpts) MustValidate() {
 	if o.Server == "" {
 		fmt.Fprintln(os.Stderr, "ERR: --server 必填,例如 --server sbc.example.com:5060")
@@ -114,6 +141,15 @@ func (o *CommonOpts) MustValidate() {
 	}
 	if o.CAFile != "" {
 		o.Insecure = false
+	}
+	if o.Insecure && (o.Transport == "tls" || o.Transport == "wss") && !Quiet {
+		fmt.Fprintln(os.Stderr, "⚠ WARNING: --insecure enabled — TLS server certificate will NOT be verified")
+	}
+	// 防误操作:--log-max-mb 太大会让单文件涨到几十 GB,且 rotate 失去意义。
+	const maxLogMB = 100_000 // 100GB,远超合理日志体量
+	if o.LogMaxMB < 0 || o.LogMaxMB > maxLogMB {
+		fmt.Fprintf(os.Stderr, "ERR: --log-max-mb 必须在 [0, %d]\n", maxLogMB)
+		os.Exit(2)
 	}
 }
 

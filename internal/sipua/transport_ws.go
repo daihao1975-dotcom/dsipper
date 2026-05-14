@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,10 @@ type wsTransport struct {
 
 	dialAddr string // client 模式记录目标 host:port,Send 时 Dial
 	dialURL  string // 完整 ws(s):// URL
+
+	// allowedOrigins 是 server 端 Origin 白名单(host 部分匹配)。
+	// 空切片表示"接受任意 Origin",此时 serveWS 会打 stderr warn。
+	allowedOrigins []string
 }
 
 // WSOptions 控制 WebSocket transport 行为。
@@ -52,8 +57,9 @@ type WSOptions struct {
 	TLS        TLSOptions // wss 时校验/SNI/CA;ws 时忽略
 
 	// 服务端独有
-	ListenAddr string     // server bind 地址
-	TLSServer  TLSOptions // wss server 时填 CertFile/KeyFile
+	ListenAddr     string     // server bind 地址
+	TLSServer      TLSOptions // wss server 时填 CertFile/KeyFile
+	AllowedOrigins []string   // server 端 Origin 白名单(主机名匹配);空=接受全部并打 warn
 }
 
 // NewWSClient 创建 client 模式 WS 或 WSS transport。首次 Send 时 Dial,后续复用同一连接。
@@ -101,11 +107,15 @@ func NewWSServer(useTLS bool, opts WSOptions) (Transport, error) {
 	}
 
 	t := &wsTransport{
-		useTLS: useTLS,
-		path:   path,
-		conns:  map[string]*websocket.Conn{},
-		inbox:  make(chan Inbound, 8192),
-		closed: make(chan struct{}),
+		useTLS:         useTLS,
+		path:           path,
+		conns:          map[string]*websocket.Conn{},
+		inbox:          make(chan Inbound, 8192),
+		closed:         make(chan struct{}),
+		allowedOrigins: append([]string(nil), opts.AllowedOrigins...),
+	}
+	if len(t.allowedOrigins) == 0 {
+		fmt.Fprintln(os.Stderr, "⚠ WARNING: WS server accepts ANY Origin (use AllowedOrigins to restrict)")
 	}
 
 	mux := http.NewServeMux()
@@ -239,12 +249,18 @@ func (t *wsTransport) Close() error {
 }
 
 // serveWS 是 server 模式的 HTTP handler,把 HTTP 升级成 WS 后挂 readLoop。
+// 当 allowedOrigins 非空时,nhooyr/websocket 默认会校验 Origin host == Request.Host。
+// 我们用 OriginPatterns 显式声明白名单;空白名单 → InsecureSkipVerify(已在 NewWSServer 打过 warn)。
 func (t *wsTransport) serveWS(w http.ResponseWriter, r *http.Request) {
-	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		Subprotocols:   []string{"sip"},
-		// 允许任意 Origin — dsipper 是 mock 工具,产线 UAS 也很少校验 Origin
-		InsecureSkipVerify: true,
-	})
+	opts := &websocket.AcceptOptions{
+		Subprotocols: []string{"sip"},
+	}
+	if len(t.allowedOrigins) > 0 {
+		opts.OriginPatterns = t.allowedOrigins
+	} else {
+		opts.InsecureSkipVerify = true
+	}
+	c, err := websocket.Accept(w, r, opts)
 	if err != nil {
 		return
 	}

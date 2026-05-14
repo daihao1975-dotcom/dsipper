@@ -161,7 +161,7 @@ Route 沿用 Record-Route。常用于实验室模拟"被叫挂机"场景。
 |---|---|---|
 | `--server` | 下游地址 host:port | (必填) |
 | `--transport` | `udp` / `tls` | udp |
-| `--insecure` | TLS 不校验 server 证书(自签场景) | true |
+| `--insecure` | TLS 不校验 server 证书(自签场景);启用时 stderr 打 warning | false |
 | `--ca <file>` | TLS 用 CA 校验,设置后自动关 `--insecure` | (空) |
 | `-v` | 0 = info / 1 = debug(打印整条 SIP message) | 0 |
 | `--log` | 日志落盘路径,空=自动 `dsipper-<cmd>-<时间戳>.log`,`-` = 仅 stderr | 空 |
@@ -177,7 +177,8 @@ dsipper options --server sbc.example.com:5061 --transport tls \
                 --ca /etc/ssl/dh-ca.pem
 ```
 
-无 `--ca` 时默认走 InsecureSkipVerify(便于自签证书场景调试)。
+v0.12 起 `--insecure` 默认为 **false**(严格校验):自签 SBC 必须配 `--ca <pem>`
+或显式 `--insecure`(每次运行会打 stderr 警告)。
 
 ## 编译与跨平台
 

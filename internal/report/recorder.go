@@ -393,15 +393,17 @@ func (r *Recorder) SaveHTML(path string) (string, error) {
 	asFile := strings.HasSuffix(strings.ToLower(target), ".html") ||
 		strings.HasSuffix(strings.ToLower(target), ".htm")
 	if !asFile {
-		_ = os.MkdirAll(target, 0755)
+		// 0700:HTML 报告含 SIP 头(可能含 Authorization / 用户身份),目录限本用户
+		_ = os.MkdirAll(target, 0700)
 		ts := time.Now().Format("20060102-150405")
 		target = filepath.Join(target, fmt.Sprintf("dsipper-%s-%s.html", r.Subcmd, ts))
 	} else if dir := filepath.Dir(target); dir != "" {
-		_ = os.MkdirAll(dir, 0755)
+		_ = os.MkdirAll(dir, 0700)
 	}
 
 	view := buildView(r, calls)
-	f, err := os.Create(target)
+	// 0600:HTML 报告含完整 SIP 信令,可能内嵌 digest hash / 联系人;限本用户读写
+	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return "", err
 	}

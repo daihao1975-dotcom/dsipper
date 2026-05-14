@@ -329,6 +329,8 @@ func ResolveAddr(proto, hostport string) (net.Addr, error) {
 
 // logSIP 把一条 SIP message 多行打印,带方向 + first line。
 // 同时把事件喂给 Recorder(若挂载)。
+// Debug 路径会脱敏 Authorization / Proxy-Authorization / WWW-Authenticate / Proxy-Authenticate
+// 的敏感字段(response / nonce / cnonce),防止日志泄露 digest hash 与挑战值。
 func (u *UAC) logSIP(dir string, m *Message) {
 	if u.Recorder != nil {
 		u.Recorder.Record(dir, m, u.Server)
@@ -346,8 +348,82 @@ func (u *UAC) logSIP(dir string, m *Message) {
 		"call-id", m.Headers.Get("Call-ID"),
 		"cseq", m.Headers.Get("CSeq"),
 	)
-	// 完整 message 用 Debug
-	u.Log.Debug(dir+" raw", "msg", "\n"+string(m.Build()))
+	// 完整 message 用 Debug — 在 wire 字节流上脱敏 auth 头
+	u.Log.Debug(dir+" raw", "msg", "\n"+redactAuthHeaders(string(m.Build())))
+}
+
+// redactAuthHeaders 在 SIP 文本中把 Authorization / WWW-Authenticate 等行的
+// response="..." / nonce="..." / cnonce="..." 字段值替换为 <redacted>。
+// 设计取舍:用纯文本替换而不是结构化重建,避免影响其它字段;只处理 4 类已知敏感头。
+func redactAuthHeaders(raw string) string {
+	lines := strings.Split(raw, "\r\n")
+	for i, line := range lines {
+		colon := strings.IndexByte(line, ':')
+		if colon <= 0 {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(line[:colon]))
+		switch name {
+		case "authorization", "proxy-authorization", "www-authenticate", "proxy-authenticate":
+			lines[i] = line[:colon+1] + " " + redactDigestParams(line[colon+1:])
+		}
+	}
+	return strings.Join(lines, "\r\n")
+}
+
+func redactDigestParams(v string) string {
+	for _, key := range []string{"response", "nonce", "cnonce"} {
+		v = redactParam(v, key)
+	}
+	return v
+}
+
+// redactParam 在 v 中把 `<key>="..."` 或 `<key>=...` 的值替换为 <redacted>。
+// 仅匹配作为参数 token 出现的 key(前面允许空白/逗号/Digest 开头),避免误伤实质内容。
+func redactParam(v, key string) string {
+	low := strings.ToLower(v)
+	klow := strings.ToLower(key)
+	start := 0
+	var out strings.Builder
+	for {
+		idx := strings.Index(low[start:], klow+"=")
+		if idx < 0 {
+			out.WriteString(v[start:])
+			return out.String()
+		}
+		abs := start + idx
+		// 必须是 token 边界(前一字符是空白 / 逗号 / 行首)
+		if abs > 0 {
+			prev := v[abs-1]
+			if prev != ' ' && prev != '\t' && prev != ',' {
+				out.WriteString(v[start : abs+len(key)+1])
+				start = abs + len(key) + 1
+				continue
+			}
+		}
+		out.WriteString(v[start : abs+len(key)+1])
+		// 跳过原值
+		valStart := abs + len(key) + 1
+		end := valStart
+		if end < len(v) && v[end] == '"' {
+			// quoted: 找下一个 "
+			end++
+			for end < len(v) && v[end] != '"' {
+				end++
+			}
+			if end < len(v) {
+				end++ // 含闭引号
+			}
+			out.WriteString(`"<redacted>"`)
+		} else {
+			// 无引号:直到逗号 / 空白
+			for end < len(v) && v[end] != ',' && v[end] != ' ' && v[end] != '\t' {
+				end++
+			}
+			out.WriteString("<redacted>")
+		}
+		start = end
+	}
 }
 
 // PickLocalIP 选一个能路由到 server 的本机出口 IP。

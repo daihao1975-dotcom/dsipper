@@ -30,8 +30,9 @@ type RotatingFile struct {
 
 // NewRotatingFile 打开/创建 path,size 上限 maxBytes(<=0 时关闭滚动,等价 OpenFile)。
 // 如果 path 已存在,继续 append,size 从当前文件大小算起。
+// 文件模式 0600(日志可能含 Authorization / Call-ID / Contact 等敏感信息)。
 func NewRotatingFile(path string, maxBytes int64) (*RotatingFile, error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -82,12 +83,23 @@ func (r *RotatingFile) rotateLocked() error {
 		fmt.Fprintf(os.Stderr, "WARN: log rotate close: %v\n", err)
 	}
 	oldPath := r.path + ".old"
-	// 先删旧 .old(Windows rename 不能覆盖)
-	_ = os.Remove(oldPath)
-	if err := os.Rename(r.path, oldPath); err != nil {
+	// 防 symlink 攻击:如果 oldPath 已存在且是 symlink,拒绝 rename
+	// (避免攻击者预放 symlink 指向 /etc/shadow 等敏感路径)
+	if fi, err := os.Lstat(oldPath); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			fmt.Fprintf(os.Stderr, "WARN: log rotate: %s is a symlink, refusing to overwrite\n", oldPath)
+			// 还是要重开新文件,否则日志主路径满了卡死;此处直接换新文件不 rename
+			_ = r.f.Close()
+		} else {
+			_ = os.Remove(oldPath)
+			if err := os.Rename(r.path, oldPath); err != nil {
+				fmt.Fprintf(os.Stderr, "WARN: log rotate rename: %v\n", err)
+			}
+		}
+	} else if err := os.Rename(r.path, oldPath); err != nil {
 		fmt.Fprintf(os.Stderr, "WARN: log rotate rename: %v\n", err)
 	}
-	nf, err := os.OpenFile(r.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	nf, err := os.OpenFile(r.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("reopen log: %w", err)
 	}

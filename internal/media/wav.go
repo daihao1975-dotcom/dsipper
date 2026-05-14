@@ -12,6 +12,11 @@ import (
 // SIP mock 场景里输入/输出都是 8000 Hz mono,但读时不强制采样率,
 // 调用方自行处理(若 != 8000 需要 resample,本工具不做)。
 
+// maxWAVChunkBytes 是单个 RIFF chunk 的硬上限(50 MB),防御恶意 WAV 把
+// 4 GiB size 字段直接喂进 make([]byte, size) 触发 OOM。50MB @ 8kHz 16-bit
+// mono 已是 ~52 分钟音频,SIP mock 场景绝对够用。
+const maxWAVChunkBytes = 50 * 1024 * 1024
+
 // ReadWAV16Mono 读一个 16-bit mono WAV 文件,返回 PCM samples + sampleRate。
 func ReadWAV16Mono(path string) (samples []int16, sampleRate int, err error) {
 	f, err := os.Open(path)
@@ -34,8 +39,14 @@ func ReadWAV16Mono(path string) (samples []int16, sampleRate int, err error) {
 			return nil, 0, err
 		}
 		size := binary.LittleEndian.Uint32(ck[4:8])
+		if size > maxWAVChunkBytes {
+			return nil, 0, fmt.Errorf("WAV chunk %q too large: %d bytes (cap %d)", string(ck[0:4]), size, maxWAVChunkBytes)
+		}
 		switch string(ck[0:4]) {
 		case "fmt ":
+			if size < 16 {
+				return nil, 0, fmt.Errorf("WAV fmt chunk too small: %d bytes", size)
+			}
 			body := make([]byte, size)
 			if _, err := io.ReadFull(f, body); err != nil {
 				return nil, 0, err
@@ -76,9 +87,9 @@ func ReadWAV16Mono(path string) (samples []int16, sampleRate int, err error) {
 	}
 }
 
-// WriteWAV16Mono 把 16-bit mono PCM 写入 WAV 文件。
+// WriteWAV16Mono 把 16-bit mono PCM 写入 WAV 文件。文件权限 0600(可能含敏感语音录音)。
 func WriteWAV16Mono(path string, samples []int16, sampleRate int) error {
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}

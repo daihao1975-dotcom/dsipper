@@ -136,6 +136,9 @@ func Parse(body string) (Answer, error) {
 				if err != nil {
 					return a, fmt.Errorf("invalid m=audio port: %w", err)
 				}
+				if port < 0 || port > 65535 {
+					return a, fmt.Errorf("m=audio port out of range: %d", port)
+				}
 				a.AudioPort = port
 				a.Profile = parts[2]
 				if pt, err := strconv.Atoi(parts[3]); err == nil {

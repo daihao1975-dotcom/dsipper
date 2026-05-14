@@ -4,8 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
-	"math/rand"
 	"os"
 	"strings"
 	"time"
@@ -17,6 +17,13 @@ import (
 	"dsipper/internal/sdp"
 	"dsipper/internal/sipua"
 )
+
+// maxScenarioBytes 是单个 scenario YAML 文件的硬上限(10MB)。
+// 防御 attacker 给 dsipper 喂 GB 级 YAML 把进程 OOM。
+const maxScenarioBytes = 10 * 1024 * 1024
+
+// maxScenarioSteps 单脚本步骤上限,防退化为 DoS 工具。
+const maxScenarioSteps = 10_000
 
 // scenarioFile 是 YAML 顶层结构。Default 段给所有步骤铺底,各步骤可覆盖。
 type scenarioFile struct {
@@ -79,9 +86,20 @@ func Scenario(args []string) {
 	}
 	path := fs.Arg(0)
 
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERR: open %s: %v\n", path, err)
+		os.Exit(2)
+	}
+	// 限制读取上限 + 1 字节,触发上限就报错,避免静默截断后解析出半残 YAML。
+	data, err := io.ReadAll(io.LimitReader(f, maxScenarioBytes+1))
+	f.Close()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERR: read %s: %v\n", path, err)
+		os.Exit(2)
+	}
+	if len(data) > maxScenarioBytes {
+		fmt.Fprintf(os.Stderr, "ERR: %s exceeds %d bytes cap\n", path, maxScenarioBytes)
 		os.Exit(2)
 	}
 	var sc scenarioFile
@@ -91,6 +109,10 @@ func Scenario(args []string) {
 	}
 	if len(sc.Steps) == 0 {
 		fmt.Fprintln(os.Stderr, "ERR: scenario has no steps")
+		os.Exit(2)
+	}
+	if len(sc.Steps) > maxScenarioSteps {
+		fmt.Fprintf(os.Stderr, "ERR: scenario has %d steps, cap %d\n", len(sc.Steps), maxScenarioSteps)
 		os.Exit(2)
 	}
 
@@ -468,6 +490,6 @@ func defaultStrPlain(s, d string) string {
 	return s
 }
 
-// 静态分配防 import 失败:rand 引用确保 invite 路径用到 SineTone 等。
-var _ = rand.Int
+// 静态分配防 import 失败:确保 invite 路径用到 SineTone 等。
 var _ = sdp.PCMA
+var _ = media.SineTone
