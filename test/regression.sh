@@ -48,11 +48,21 @@ FAILED=()
 SELECTED=("$@")
 
 case_should_run() {
-  if [ ${#SELECTED[@]} -eq 0 ]; then return 0; fi
+  if [ ${#SELECTED[@]} -eq 0 ]; then _truncate_case_logs "$1"; return 0; fi
   for n in "${SELECTED[@]}"; do
-    if [ "$n" = "$1" ]; then return 0; fi
+    if [ "$n" = "$1" ]; then _truncate_case_logs "$1"; return 0; fi
   done
   return 1
+}
+
+# dsipper opens --log paths in O_APPEND mode (logsink/rotating.go), so stale
+# content from a previous run would inflate grep counts when KEEP_LOGS=1.
+# Truncate the standard L/I log paths at case start so each run sees a fresh
+# slate regardless of what prior runs left behind.
+_truncate_case_logs() {
+  local n=$1
+  : > /tmp/_dsipper-c${n}-L.log
+  : > /tmp/_dsipper-c${n}-I.log
 }
 
 cleanup_case() {
